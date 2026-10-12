@@ -17,6 +17,7 @@ import shutil
 import stat
 import sys
 import tarfile
+import time
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -90,9 +91,16 @@ def windows(build, out, version):
     archive = dest + ('-%s' % version if version else '') + '.zip'
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
         for dirpath, _, files in os.walk(dest):
-            for f in files:
+            for f in sorted(files):
                 p = os.path.join(dirpath, f)
-                z.write(p, os.path.join('ReCompiledSteel', os.path.relpath(p, dest)))
+                # Zip entries hold a local clock time; store UTC so the
+                # package says nothing about the machine's time zone.
+                info = zipfile.ZipInfo(os.path.join('ReCompiledSteel', os.path.relpath(p, dest)).replace(os.sep, '/'),
+                                       date_time=time.gmtime(os.path.getmtime(p))[:6])
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o644 << 16
+                with open(p, 'rb') as src:
+                    z.writestr(info, src.read())
     print('wrote %s' % archive)
     return archive
 

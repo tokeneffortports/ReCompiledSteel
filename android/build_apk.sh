@@ -73,7 +73,7 @@ ls -la "$WORK/pkg/lib/arm64-v8a"
 
 echo "== Assembling, aligning, signing =="
 python3 - "$WORK/base.apk" "$WORK/unsigned.apk" "$WORK/pkg" <<'PY'
-import os, shutil, sys, zipfile
+import os, shutil, sys, time, zipfile
 base, out, pkg = sys.argv[1:4]
 shutil.copyfile(base, out)
 with zipfile.ZipFile(out, 'a') as z:
@@ -81,7 +81,12 @@ with zipfile.ZipFile(out, 'a') as z:
         for name in sorted(files):
             path = os.path.join(root, name)
             arc = os.path.relpath(path, pkg).replace(os.sep, '/')
-            z.write(path, arc, compress_type=zipfile.ZIP_DEFLATED)
+            # UTC entry times: nothing about the build machine's time zone.
+            info = zipfile.ZipInfo(arc, date_time=time.gmtime(os.path.getmtime(path))[:6])
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            with open(path, 'rb') as src:
+                z.writestr(info, src.read())
 PY
 "$BT/zipalign" -f -P 16 4 "$WORK/unsigned.apk" "$WORK/aligned.apk"
 if [[ ! -f "$KEYSTORE" ]]; then

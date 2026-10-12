@@ -63,9 +63,9 @@ took off your Xbox 360.
 ## Checksums (SHA-256)
 
 ```
-fe8301e1a88d6fd7ac68d6a8d26dfe5ef39a3540e65a20a7ad965848da76960a  ReCompiledSteel-windows-x64-0.1.0.zip
+92637a3f52dfbe29be11ed861bb2de6e1724708f4899e8d6118ec6a5ccb5210f  ReCompiledSteel-windows-x64-0.1.0.zip
 f0ff5af7d9bc4e20e041972acce54c41bb72da7db247a2b89c7525ede7f97046  ReCompiledSteel-linux-x64-0.1.0.tar.gz
-e9b879f98ad7fb87876de73dc8198f8e0c9e673f01ca99bdc3523bcac914e436  ReCompiledSteel-android-arm64-0.1.0.apk
+dcd5f7d57127e2738b0733f80291a0f2f540e6a8420c8f660b9af25b1c5fd12f  ReCompiledSteel-android-arm64-0.1.0.apk
 ```
 
 Only download from this page, and compare the checksum if a copy reached you
