@@ -14,7 +14,8 @@ from then on the game's own MULTIPLAYER menu just works:
 
 The server never carries the fight itself. Matches are peer to peer, so a tiny
 machine can serve a lot of players. It is one Python file with no
-dependencies: [tools/lobby/realsteel_lobby.py](tools/lobby/realsteel_lobby.py).
+dependencies: `tools/lobby/realsteel_lobby.py`, in this repository and in every
+release download.
 
 ---
 
