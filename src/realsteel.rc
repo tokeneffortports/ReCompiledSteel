@@ -1,0 +1,2 @@
+// The executable icon (tools/release/make_icon.py draws realsteel.ico).
+1 ICON "realsteel.ico"

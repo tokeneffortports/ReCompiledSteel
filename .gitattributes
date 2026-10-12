@@ -1,0 +1,7 @@
+# Line endings: LF in the repository, CRLF only for Windows scripts.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.zip binary

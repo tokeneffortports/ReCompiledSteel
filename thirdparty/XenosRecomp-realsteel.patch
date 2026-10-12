@@ -1,0 +1,964 @@
+diff --git a/XenosRecomp/dxc_compiler.cpp b/XenosRecomp/dxc_compiler.cpp
+index fcbc43a..b4c224b 100644
+--- a/XenosRecomp/dxc_compiler.cpp
++++ b/XenosRecomp/dxc_compiler.cpp
+@@ -11,8 +11,34 @@ DxcCompiler::~DxcCompiler()
+     dxcCompiler->Release();
+ }
+ 
+-IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv)
++// Real Steel (2026-10-11): constants are read from a bound storage buffer at
++// 32-bit offsets instead of through 64-bit buffer device addresses (those
++// need shaderInt64, which the Adreno Android driver lacks). The recompiler's
++// vk::RawBufferLoad<T>(address[, alignment]) calls become the RsLoad*
++// helpers of the prelude (rs_shader_common.h).
++static std::string RewriteConstantLoads(const std::string& in)
+ {
++    static const std::pair<const char*, const char*> kLoads[] = {
++        {"vk::RawBufferLoad<uint>(", "RsLoadU("},   {"vk::RawBufferLoad<uint2>(", "RsLoadU2("},
++        {"vk::RawBufferLoad<uint4>(", "RsLoadU4("}, {"vk::RawBufferLoad<int>(", "RsLoadI("},
++        {"vk::RawBufferLoad<float>(", "RsLoadF("},  {"vk::RawBufferLoad<float2>(", "RsLoadF2("},
++        {"vk::RawBufferLoad<float3>(", "RsLoadF3("}, {"vk::RawBufferLoad<float4>(", "RsLoadF4("},
++    };
++    std::string out = in;
++    for (const auto& [from, to] : kLoads)
++    {
++        const size_t fromLen = strlen(from), toLen = strlen(to);
++        for (size_t at = out.find(from); at != std::string::npos; at = out.find(from, at + toLen))
++            out.replace(at, fromLen, to);
++    }
++    if (out.find("vk::RawBufferLoad") != std::string::npos)
++        fputs("XenosRecomp: a vk::RawBufferLoad of an unhandled type is left in the shader\n", stderr);
++    return out;
++}
++
++IDxcBlob* DxcCompiler::compile(const std::string& originalSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv)
++{
++    const std::string shaderSource = RewriteConstantLoads(originalSource);
+     DxcBuffer source{};
+     source.Ptr = shaderSource.c_str();
+     source.Size = shaderSource.size();
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d015145..09da60c 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -1,3 +1,4 @@
++#include "xenos_vfetch_scan.h"
+ #include "shader.h"
+ #include "shader_recompiler.h"
+ #include "dxc_compiler.h"
+@@ -27,6 +28,8 @@ struct RecompiledShader
+     IDxcBlob* dxil = nullptr;
+     std::vector<uint8_t> spirv;
+     uint32_t specConstantsMask = 0;
++    std::vector<VertexFetchRecord> vertexFetches;  // Real Steel (2026-08-29)
++    bool vertexTemplate = false;                    // Real Steel (2026-10-02)
+ };
+ 
+ int main(int argc, char** argv)
+@@ -94,10 +97,26 @@ int main(int argc, char** argv)
+                     shaderContainer->field20 == 0)
+                 {
+                     XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
++                    // Real Steel (2026-10-02): on-disk vertex shaders (blank
++                    // vfetch block) are cached under their template key so
++                    // the renderer finds them from any runtime-patched form.
++                    bool vertexTemplate = false;
++                    {
++                        bool isVertex = false;
++                        std::vector<rs::vfetch::ScannedFetch> fetches;
++                        const uint8_t* bytes = fileData.get() + i;
++                        if (rs::vfetch::Scan(bytes, dataSize, &isVertex, fetches) && isVertex &&
++                            rs::vfetch::IsUnpatched(fetches))
++                        {
++                            hash = rs::vfetch::TemplateKey(bytes, dataSize, fetches);
++                            vertexTemplate = true;
++                        }
++                    }
+                     auto shader = shaders.try_emplace(hash);
+                     if (shader.second)
+                     {
+                         shader.first->second.data = fileData.get() + i;
++                        shader.first->second.vertexTemplate = vertexTemplate;
+                         foundAny = true;
+                     }
+ 
+@@ -121,9 +140,11 @@ int main(int argc, char** argv)
+ 
+                 thread_local ShaderRecompiler recompiler;
+                 recompiler = {};
++                recompiler.vertexTemplate = shader.vertexTemplate;
+                 recompiler.recompile(shader.data, include);
+ 
+                 shader.specConstantsMask = recompiler.specConstantsMask;
++                shader.vertexFetches = recompiler.vertexFetches;
+ 
+                 thread_local DxcCompiler dxcCompiler;
+ 
+@@ -171,6 +192,27 @@ int main(int argc, char** argv)
+ 
+         f.println("}};");
+ 
++        // Real Steel (2026-08-29): per-shader vertex-fetch table so the
++        // native renderer can build vertex-input state (formats live in the
++        // vfetch microcode, not in the container's element list). Flat array
++        // ordered like g_shaderCacheEntries; per-entry counts alongside.
++        f.println("ShaderVertexFetch g_shaderVertexFetches[] = {{");
++        size_t totalFetches = 0;
++        for (auto& [hash, shader] : shaders)
++        {
++            for (auto& fetch : shader.vertexFetches)
++            {
++                f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {} }},",
++                    hash, fetch.usage, fetch.usageIndex, fetch.offset,
++                    fetch.stride, fetch.format, fetch.flags);
++                ++totalFetches;
++            }
++        }
++        if (totalFetches == 0)
++            f.println("\t{{ 0, 0, 0, 0, 0, 0, 0 }},");
++        f.println("}};");
++        f.println("const size_t g_shaderVertexFetchCount = {};", totalFetches);
++
+         fmt::println("Compressing DXIL cache...");
+ 
+         int level = ZSTD_maxCLevel();
+@@ -211,7 +253,15 @@ int main(int argc, char** argv)
+     {
+         ShaderRecompiler recompiler;
+         size_t fileSize;
+-        recompiler.recompile(readAllBytes(input, fileSize).get(), include);
++        auto singleData = readAllBytes(input, fileSize);
++        {
++            // Real Steel (2026-10-02): same template detection as batch mode.
++            bool isVertex = false;
++            std::vector<rs::vfetch::ScannedFetch> fetches;
++            recompiler.vertexTemplate = rs::vfetch::Scan(singleData.get(), fileSize, &isVertex, fetches) &&
++                isVertex && rs::vfetch::IsUnpatched(fetches);
++        }
++        recompiler.recompile(singleData.get(), include);
+         writeAllBytes(output, recompiler.out.data(), recompiler.out.size());
+     }
+ 
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..dba975b 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -1,15 +1,32 @@
+ #ifndef SHADER_COMMON_H_INCLUDED
+ #define SHADER_COMMON_H_INCLUDED
+ 
++// Real Steel fork of XenosRecomp's shader_common.h (2026-08-29).
++// Differences from upstream:
++//   - Sampler slots widened 16 -> 20 (Xbox 360 vertex-texture samplers s16-s19;
++//     Real Steel vertex shaders sample s16). SharedConstants layout v2:
++//       bytes   0- 79  Texture2D descriptor indices, slots 0-19
++//       bytes  80-159  Texture3D descriptor indices
++//       bytes 160-239  TextureCube descriptor indices
++//       bytes 240-319  Sampler descriptor indices
++//       bytes 320-351  Boolean constants b0-b255 (8 dwords, full Xenos space;
++//                      host uploads the guest shadow at dev+10112 verbatim)
++//       byte  352      g_SwappedTexcoords
++//       bytes 356-363  g_HalfPixelOffset
++//       byte  364      g_AlphaThreshold
++//       bytes 368-383  g_ViewportScale (2026-09-05): pixel->NDC xy scale/offset
++//                      when the title disables the viewport transform; zero =
++//                      viewport enabled (SharedConstants is now 384 bytes)
++//     DXIL cbuffer: c0-c4 2D, c5-c9 3D, c10-c14 Cube, c15-c19 samplers,
++//     c20-c21 bools (two uint4), c22 the rest, c23 g_ViewportScale.
++//   - Bool constants addressed absolutely via g_Bool(n): n in 0-255,
++//     VS bools at 0+, PS bools at 128+ (matches microcode boolAddress and
++//     guest register 0x4900). Replaces upstream's 32-bit g_Booleans.
++// The matching emission changes live in xenosrecompgit's shader_recompiler.cpp.
++
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
+ 
+-#ifdef UNLEASHED_RECOMP
+-    #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+-    #define SPEC_CONSTANT_ALPHA_TO_COVERAGE (1 << 3)
+-    #define SPEC_CONSTANT_REVERSE_Z         (1 << 4)
+-#endif
+-
+ #if !defined(__cplusplus) || defined(__INTELLISENSE__)
+ 
+ #define FLT_MIN asfloat(0xff7fffff)
+@@ -17,19 +34,49 @@
+ 
+ #ifdef __spirv__
+ 
++// 2026-10-11: the three constant blocks are byte offsets into one storage
++// buffer (set 4), not 64-bit buffer device addresses - those need
++// shaderInt64, which Android's Adreno driver lacks. The recompiler's
++// RawBufferLoad<T>(...) calls (vk namespace) are rewritten to the RsLoad* functions
++// below before compiling (XenosRecomp dxc_compiler.cpp).
+ struct PushConstants
+ {
+-    uint64_t VertexShaderConstants;
+-    uint64_t PixelShaderConstants;
+-    uint64_t SharedConstants;
++    uint VertexShaderConstants;
++    uint PixelShaderConstants;
++    uint SharedConstants;
+ };
+ 
+ [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+-
+-#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+-#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+-#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+-#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++[[vk::binding(0, 4)]] ByteAddressBuffer g_ConstArena;
++
++uint   RsLoadU(uint a)              { return g_ConstArena.Load(a); }
++uint   RsLoadU(uint a, uint align)  { return g_ConstArena.Load(a); }
++uint2  RsLoadU2(uint a)             { return g_ConstArena.Load2(a); }
++uint2  RsLoadU2(uint a, uint align) { return g_ConstArena.Load2(a); }
++uint4  RsLoadU4(uint a)             { return g_ConstArena.Load4(a); }
++uint4  RsLoadU4(uint a, uint align) { return g_ConstArena.Load4(a); }
++int    RsLoadI(uint a)              { return asint(g_ConstArena.Load(a)); }
++int    RsLoadI(uint a, uint align)  { return asint(g_ConstArena.Load(a)); }
++float  RsLoadF(uint a)              { return asfloat(g_ConstArena.Load(a)); }
++float  RsLoadF(uint a, uint align)  { return asfloat(g_ConstArena.Load(a)); }
++float2 RsLoadF2(uint a)             { return asfloat(g_ConstArena.Load2(a)); }
++float2 RsLoadF2(uint a, uint align) { return asfloat(g_ConstArena.Load2(a)); }
++float3 RsLoadF3(uint a)             { return asfloat(g_ConstArena.Load3(a)); }
++float3 RsLoadF3(uint a, uint align) { return asfloat(g_ConstArena.Load3(a)); }
++float4 RsLoadF4(uint a)             { return asfloat(g_ConstArena.Load4(a)); }
++float4 RsLoadF4(uint a, uint align) { return asfloat(g_ConstArena.Load4(a)); }
++
++#define g_Bool(n) ((RsLoadU(g_PushConstants.SharedConstants + 320 + ((n) / 32) * 4) >> ((n) % 32)) & 1u)
++#define g_SwappedTexcoords         RsLoadU(g_PushConstants.SharedConstants + 352)
++#define g_HalfPixelOffset          RsLoadF2(g_PushConstants.SharedConstants + 356)
++#define g_AlphaThreshold           RsLoadF(g_PushConstants.SharedConstants + 364)
++// Viewport transform disabled (360 D3DRS_VIEWPORTENABLE = FALSE): xy = pixel
++// coords, mapped to NDC as xy * scale.xy + scale.zw. All-zero = enabled.
++#define g_ViewportScale            RsLoadF4(g_PushConstants.SharedConstants + 368)
++// Template vertex shaders (2026-10-02): destination swizzle of fetch n as the
++// game's D3D patched it for the bound vertex declaration (12 bits, 3 per
++// lane: 0-3 source lane, 4 zero, 5 one, 7 keep).
++#define g_FetchSwizzle(n)          RsLoadU(g_PushConstants.SharedConstants + 384 + (n) * 4)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
+@@ -38,15 +85,30 @@ struct PushConstants
+ #else
+ 
+ #define DEFINE_SHARED_CONSTANTS() \
+-    uint g_Booleans : packoffset(c16.x); \
+-    uint g_SwappedTexcoords : packoffset(c16.y); \
+-    float2 g_HalfPixelOffset : packoffset(c16.z); \
+-    float g_AlphaThreshold : packoffset(c17.x);
++    uint4 g_BooleansLo : packoffset(c20); \
++    uint4 g_BooleansHi : packoffset(c21); \
++    uint g_SwappedTexcoords : packoffset(c22.x); \
++    float2 g_HalfPixelOffset : packoffset(c22.y); \
++    float g_AlphaThreshold : packoffset(c22.w); \
++    float4 g_ViewportScale : packoffset(c23);     uint4 g_FetchSwizzles[4] : packoffset(c24);
++
++#define g_FetchSwizzle(n) (g_FetchSwizzles[(n) / 4][(n) % 4])
++
++#define g_Bool(n) ((((n) < 128 ? g_BooleansLo[((n) / 32) & 3] : g_BooleansHi[((n) / 32) & 3]) >> ((n) % 32)) & 1u)
+ 
+ uint g_SpecConstants();
+ 
+ #endif
+ 
++// XENOS_VERTEX_SHADER is emitted by the recompiler before this header for
++// vertex shaders: implicit-LOD Sample is only legal in pixel/compute stages,
++// and Xenos vertex texture fetches read LOD 0 anyway.
++#ifdef XENOS_VERTEX_SHADER
++#define XENOS_SAMPLE(tex, samp, coord) (tex).SampleLevel(samp, coord, 0.0)
++#else
++#define XENOS_SAMPLE(tex, samp, coord) (tex).Sample(samp, coord)
++#endif
++
+ Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+ Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+ TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+@@ -62,7 +124,7 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+@@ -71,81 +133,9 @@ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, f
+     return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
+ }
+ 
+-float w0(float a)
+-{
+-    return (1.0f / 6.0f) * (a * (a * (-a + 3.0f) - 3.0f) + 1.0f);
+-}
+-
+-float w1(float a)
+-{
+-    return (1.0f / 6.0f) * (a * a * (3.0f * a - 6.0f) + 4.0f);
+-}
+-
+-float w2(float a)
+-{
+-    return (1.0f / 6.0f) * (a * (a * (-3.0f * a + 3.0f) + 3.0f) + 1.0f);
+-}
+-
+-float w3(float a)
+-{
+-    return (1.0f / 6.0f) * (a * a * a);
+-}
+-
+-float g0(float a)
+-{
+-    return w0(a) + w1(a);
+-}
+-
+-float g1(float a)
+-{
+-    return w2(a) + w3(a);
+-}
+-
+-float h0(float a)
+-{
+-    return -1.0f + w1(a) / (w0(a) + w1(a)) + 0.5f;
+-}
+-
+-float h1(float a)
+-{
+-    return 1.0f + w3(a) / (w2(a) + w3(a)) + 0.5f;
+-}
+-
+-float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+-{
+-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    SamplerState samplerState = g_SamplerDescriptorHeap[samplerDescriptorIndex];
+-    uint2 dimensions = getTexture2DDimensions(texture);
+-    
+-    float x = texCoord.x * dimensions.x + offset.x;
+-    float y = texCoord.y * dimensions.y + offset.y;
+-
+-    x -= 0.5f;
+-    y -= 0.5f;
+-    float px = floor(x);
+-    float py = floor(y);
+-    float fx = x - px;
+-    float fy = y - py;
+-
+-    float g0x = g0(fx);
+-    float g1x = g1(fx);
+-    float h0x = h0(fx);
+-    float h1x = h1(fx);
+-    float h0y = h0(fy);
+-    float h1y = h1(fy);
+-
+-    float4 r =
+-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+-
+-    return r;
+-}
+-
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return XENOS_SAMPLE(g_Texture3DDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+ }
+ 
+ struct CubeMapData
+@@ -156,17 +146,21 @@ struct CubeMapData
+ 
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    return XENOS_SAMPLE(g_TextureCubeDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+ }
+ 
+ float4 tfetchR11G11B10(uint4 value)
+ {
+     if (g_SpecConstants() & SPEC_CONSTANT_R11G11B10_NORMAL)
+     {
++        // Real Steel (2026-09-06): the title's packed normals (vertex format
++        // 17) are 10-11-11 — x in bits 0-9, y in 10-20, z in 21-31, two's
++        // complement — verified on raw VB dwords (unit length only in this
++        // layout). Upstream decoded 11-11-10, which faceted every lit mesh.
+         return float4(
+-            (value.x & 0x00000400 ? -1.0 : 0.0) + ((value.x & 0x3FF) / 1024.0),
+-            (value.x & 0x00200000 ? -1.0 : 0.0) + (((value.x >> 11) & 0x3FF) / 1024.0),
+-            (value.x & 0x80000000 ? -1.0 : 0.0) + (((value.x >> 22) & 0x1FF) / 512.0),
++            (value.x & 0x00000200 ? -1.0 : 0.0) + ((value.x & 0x1FF) / 512.0),
++            (value.x & 0x00100000 ? -1.0 : 0.0) + (((value.x >> 10) & 0x3FF) / 1024.0),
++            (value.x & 0x80000000 ? -1.0 : 0.0) + (((value.x >> 21) & 0x3FF) / 1024.0),
+             0.0);
+     }
+     else
+@@ -185,7 +179,7 @@ float4 cube(float4 value, inout CubeMapData cubeMapData)
+     uint index = cubeMapData.cubeMapIndex;
+     cubeMapData.cubeMapDirections[index] = value.xyz;
+     ++cubeMapData.cubeMapIndex;
+-    
++
+     return float4(0.0, 0.0, 0.0, index);
+ }
+ 
+@@ -204,17 +198,26 @@ float4 max4(float4 src0)
+     return max(max(src0.x, src0.y), max(src0.z, src0.w));
+ }
+ 
+-float2 getPixelCoord(uint resourceDescriptorIndex, float2 texCoord)
++// Template vertex shaders (2026-10-02): applies a runtime vfetch destination
++// swizzle (see g_FetchSwizzle).
++float rsFetchLane(float current, float4 value, uint select)
+ {
+-    return getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]) * texCoord;
++    if (select < 4)
++        return value[select];
++    if (select == 4)
++        return 0.0;
++    if (select == 5)
++        return 1.0;
++    return current;
+ }
+ 
+-float computeMipLevel(float2 pixelCoord)
++float4 rsVertexFetch(float4 current, float4 value, uint swizzle)
+ {
+-    float2 dx = ddx(pixelCoord);
+-    float2 dy = ddy(pixelCoord);
+-    float deltaMaxSqr = max(dot(dx, dx), dot(dy, dy));
+-    return max(0.0, 0.5 * log2(deltaMaxSqr));
++    return float4(
++        rsFetchLane(current.x, value, swizzle & 7),
++        rsFetchLane(current.y, value, (swizzle >> 3) & 7),
++        rsFetchLane(current.z, value, (swizzle >> 6) & 7),
++        rsFetchLane(current.w, value, (swizzle >> 9) & 7));
+ }
+ 
+ #endif
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..305e49e 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1,4 +1,6 @@
+ #include "shader_recompiler.h"
++#include <cstdlib>
++#include <cstdio>
+ #include "shader_common.h"
+ 
+ static constexpr char SWIZZLES[] = 
+@@ -115,7 +117,11 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::TexCoord, 14 },
+     { DeclUsage::TexCoord, 15 },
+     { DeclUsage::Color, 0 },
+-    { DeclUsage::Color, 1 }
++    { DeclUsage::Color, 1 },
++    // Real Steel (2026-08-29): 23 of 54 shaders route an interpolator through
++    // COLOR3 (none use COLOR2, declared anyway for symmetry).
++    { DeclUsage::Color, 2 },
++    { DeclUsage::Color, 3 }
+ };
+ 
+ static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+@@ -130,6 +136,19 @@ static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t inde
+     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
+ }
+ 
++// Real Steel (2026-08-29): a fetch whose destination mask is entirely
++// constant-0/1/keep would otherwise emit "rN. = src.;" — malformed HLSL.
++static bool hasAnyDstWrite(uint32_t dstSwizzle)
++{
++    for (uint32_t i = 0; i < 4; i++)
++    {
++        const auto swizzle = getDestSwizzle(dstSwizzle, i);
++        if (swizzle >= FetchDestinationSwizzle::X && swizzle <= FetchDestinationSwizzle::W)
++            return true;
++    }
++    return false;
++}
++
+ void ShaderRecompiler::printDstSwizzle(uint32_t dstSwizzle, bool operand)
+ {
+     for (size_t i = 0; i < 4; i++)
+@@ -160,6 +179,83 @@ void ShaderRecompiler::printDstSwizzle01(uint32_t dstRegister, uint32_t dstSwizz
+ 
+ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t address)
+ {
++    // Real Steel: record the fetch for the cache's vertex-input table.
++    // Mini-fetches inherit format/stride from the previous full fetch and
++    // read the dwords immediately following it; resolve them here since this
++    // walk follows execution order.
++    {
++        auto formatDwords = [](uint32_t format) -> uint32_t {
++            switch (format)
++            {
++            case 26: case 32: case 34: case 37: return 2;
++            case 57: return 3;
++            case 35: case 38: return 4;
++            default: return 1;
++            }
++        };
++
++        VertexFetchRecord record{};
++        const auto element = vertexElements.find(address);
++        if (element != vertexElements.end())
++        {
++            record.usage = uint32_t(element->second.usage);
++            record.usageIndex = uint32_t(element->second.usageIndex);
++        }
++        else
++        {
++            record.usage = 0xFF;
++        }
++        if (vertexTemplate)
++        {
++            uint32_t keepMask = 0;
++            for (uint32_t i = 0; i < 4; i++)
++            {
++                if (getDestSwizzle(instr.dstSwizzle, i) == FetchDestinationSwizzle::Keep)
++                    keepMask |= 1u << i;
++            }
++            record.flags = 0x80000000u | (templateFetchCount << 16) |
++                           (uint32_t(instr.dstRegister) << 8) | (keepMask << 4);
++        }
++        else if (instr.isMiniFetch)
++        {
++            // Mini-fetches carry their own offset/format/number-format bits
++            // (as in xenia); only the stride and fetch constant come from the
++            // preceding full fetch. The earlier "offset 0 means continue after
++            // the previous fetch" heuristic mislabelled the robot VS, whose
++            // runtime-patched fetch block starts with a constant-zero weight
++            // fetch followed by the real position mini-fetch at offset 0.
++            record.offset = uint32_t(instr.offset);
++            record.format = instr.format;
++            record.stride = lastVfetchStride;
++            record.flags = 1u | (instr.signedRfModeAll ? 2u : 0u) |
++                           (instr.numFormatAll ? 4u : 0u) |
++                           (instr.formatCompAll ? 8u : 0u);
++            lastVfetchEnd = record.offset + formatDwords(record.format);
++        }
++        else
++        {
++            record.offset = uint32_t(instr.offset);
++            record.stride = instr.stride;
++            record.format = instr.format;
++            record.flags = (instr.signedRfModeAll ? 2u : 0u) |
++                           (instr.numFormatAll ? 4u : 0u) |
++                           (instr.formatCompAll ? 8u : 0u);
++            lastVfetchEnd = record.offset + formatDwords(record.format);
++            lastVfetchStride = record.stride;
++            lastVfetchFormat = record.format;
++            lastVfetchFlags = record.flags;
++        }
++        vertexFetches.push_back(record);
++        if (std::getenv("XENOS_DUMP_VFETCH"))
++        {
++            std::fprintf(stderr, "[vfetch] addr=%u dst=r%u dstSwz=%03X src=r%u srcSwz=%u const=%u.%u mini=%u fmt=%u off=%d stride=%u numFmt=%u fmtComp=%u signedRf=%u expAdj=%d rounded=%u pred=%u usage=%u.%u -> rec(off=%u fmt=%u stride=%u flags=%u)\n",
++                address, instr.dstRegister, instr.dstSwizzle, instr.srcRegister, instr.srcSwizzle, instr.constIndex, instr.constIndexSelect,
++                instr.isMiniFetch, instr.format, instr.offset, instr.stride, instr.numFormatAll, instr.formatCompAll, instr.signedRfModeAll,
++                instr.expAdjust, instr.isIndexRounded, instr.isPredicated, record.usage, record.usageIndex,
++                record.offset, record.format, record.stride, record.flags);
++        }
++    }
++
+     if (instr.isPredicated)
+     {
+         indent();
+@@ -170,50 +266,79 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+         ++indentation;
+     }
+ 
+-    indent();
+-    print("r{}.", instr.dstRegister);
+-    printDstSwizzle(instr.dstSwizzle, false);
++    if (vertexTemplate)
++    {
++        auto findResult = vertexElements.find(address);
++        assert(findResult != vertexElements.end());
++        indent();
++        print("r{0} = rsVertexFetch(r{0}, float4(", uint32_t(instr.dstRegister));
++        switch (findResult->second.usage)
++        {
++        case DeclUsage::Normal:
++        case DeclUsage::Tangent:
++        case DeclUsage::Binormal:
++            specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++            print("tfetchR11G11B10(i{}{})", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
++            break;
++        case DeclUsage::TexCoord:
++            print("tfetchTexcoord(g_SwappedTexcoords, i{}{}, {})", USAGE_VARIABLES[uint32_t(findResult->second.usage)],
++                uint32_t(findResult->second.usageIndex), uint32_t(findResult->second.usageIndex));
++            break;
++        default:
++            print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
++            break;
++        }
++        println("), g_FetchSwizzle({}));", templateFetchCount);
++        ++templateFetchCount;
++    }
++    else if (hasAnyDstWrite(instr.dstSwizzle))
++    {
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
+ 
+-    out += " = ";
++        out += " = ";
+ 
+-    auto findResult = vertexElements.find(address);
+-    assert(findResult != vertexElements.end());
++        auto findResult = vertexElements.find(address);
++        assert(findResult != vertexElements.end());
+ 
+-    switch (findResult->second.usage)
+-    {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+-        print("tfetchR11G11B10(");
+-        break;
++        switch (findResult->second.usage)
++        {
++        case DeclUsage::Normal:
++        case DeclUsage::Tangent:
++        case DeclUsage::Binormal:
++            specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++            print("tfetchR11G11B10(");
++            break;
+ 
+-    case DeclUsage::TexCoord:
+-        print("tfetchTexcoord(g_SwappedTexcoords, ");
+-        break;
+-    }
++        case DeclUsage::TexCoord:
++            print("tfetchTexcoord(g_SwappedTexcoords, ");
++            break;
++        }
+ 
+-    print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
++        print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
+ 
+-    switch (findResult->second.usage)
+-    {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        out += ')';
+-        break;
++        switch (findResult->second.usage)
++        {
++        case DeclUsage::Normal:
++        case DeclUsage::Tangent:
++        case DeclUsage::Binormal:
++            out += ')';
++            break;
+ 
+-    case DeclUsage::TexCoord:
+-        print(", {})", uint32_t(findResult->second.usageIndex));
+-        break;
+-    }
++        case DeclUsage::TexCoord:
++            print(", {})", uint32_t(findResult->second.usageIndex));
++            break;
++        }
+ 
+-    out += '.';
+-    printDstSwizzle(instr.dstSwizzle, true);
++        out += '.';
++        printDstSwizzle(instr.dstSwizzle, true);
+ 
+-    out += ";\n";
++        out += ";\n";
++    }
+ 
+-    printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++    if (!vertexTemplate)
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+ 
+     if (instr.isPredicated)
+     {
+@@ -277,6 +402,21 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     }
+ #endif
+ 
++    // Real Steel (2026-08-29): all-constant destination mask — no sample
++    // needed, just the 0/1 channel writes (see hasAnyDstWrite).
++    if (!hasAnyDstWrite(instr.dstSwizzle))
++    {
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     indent();
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+@@ -1105,11 +1245,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++
++    // Real Steel (2026-08-29): let the prelude pick SampleLevel(0) for vertex
++    // shaders — implicit-LOD Sample is invalid outside pixel/compute stages.
++    if (!isPixelShader)
++        out += "#define XENOS_VERTEX_SHADER\n";
++
+     out += include;
+     out += '\n';
+ 
+-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
+-
+     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+ 
+@@ -1171,14 +1316,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         case RegisterSet::Sampler:
+         {
++            // Real Steel layout v2 (rs_shader_common.h): 20 slots per section
++            // (80-byte stride) — slots 16-19 are the 360's vertex-texture
++            // samplers, which Real Steel uses.
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
++                    constantName, TEXTURE_DIMENSIONS[j], j * 80 + constantInfo->registerIndex * 4);
+             }
+ 
+             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
++                constantName, std::size(TEXTURE_DIMENSIONS) * 80 + constantInfo->registerIndex * 4);
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+@@ -1187,6 +1335,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    // Real Steel: fetch instructions can reference sampler slots absent from
++    // the constant table (e.g. vertex-texture slot 16); the fetch emitter
++    // falls back to the generic name s{N}, so declare every unnamed slot.
++    for (uint32_t slot = 0; slot < 20; slot++)
++    {
++        if (samplers.find(slot) != samplers.end())
++            continue;
++
++        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++        {
++            println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++                slot, TEXTURE_DIMENSIONS[j], j * 80 + slot * 4);
++        }
++
++        println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++            slot, std::size(TEXTURE_DIMENSIONS) * 80 + slot * 4);
++    }
++
+     out += "\n#else\n\n";
+ 
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
+@@ -1230,15 +1396,33 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         {
+             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+ 
++            // Real Steel layout v2: 20 slots per section = 5 registers.
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                    constantName, TEXTURE_DIMENSIONS[j], j * 5 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+             }
+ 
+             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                constantName, 5 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++        }
++    }
++
++    // Real Steel: declare unnamed sampler slots (see the SPIR-V branch).
++    // packoffsets must not overlap named members, hence the map check.
++    for (uint32_t slot = 0; slot < 20; slot++)
++    {
++        if (samplers.find(slot) != samplers.end())
++            continue;
++
++        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++        {
++            println("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});",
++                slot, TEXTURE_DIMENSIONS[j], j * 5 + slot / 4, SWIZZLES[slot % 4]);
+         }
++
++        println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});",
++            slot, 5 * std::size(TEXTURE_DIMENSIONS) + slot / 4, SWIZZLES[slot % 4]);
+     }
+ 
+     out += "\tDEFINE_SHARED_CONSTANTS();\n";
+@@ -1253,8 +1437,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         if (constantInfo->registerSet == RegisterSet::Bool)
+         {
++            // Real Steel (2026-08-29): bools are addressed absolutely via
++            // g_Bool(n) over the full 256-bit Xenos space (rs_shader_common.h)
++            // — microcode boolAddress is absolute (PS bools at 128+), so the
++            // per-stage bit-macro scheme could never match it. The name is
++            // kept only as a comment for readability.
+             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+-            println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
++            println("\t// bool b{} = {}", constantInfo->registerIndex + (isPixelShader ? 128 : 0), constantName);
+             boolConstants.emplace(constantInfo->registerIndex, constantName);
+         }
+     }
+@@ -1449,6 +1638,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     #ifdef UNLEASHED_RECOMP
+         if (!hasMtxProjection)
+             out += "\toPos = 0.0;\n";
++    #else
++        // Real Steel: upstream only initializes oPos inside the
++        // UNLEASHED_RECOMP path; without it DXC rejects shaders whose
++        // control flow doesn't provably write every oPos component.
++        out += "\toPos = 0.0;\n";
+     #endif
+ 
+         for (auto& [usage, usageIndex] : INTERPOLATORS)
+@@ -1612,7 +1806,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             uint32_t sequence = 0;
+             bool shouldReturn = false;
+             bool shouldCloseCurlyBracket = false;
++            bool condExecGuard = false;
+ 
++            if (std::getenv("XENOS_DUMP_VFETCH"))
++            {
++                std::fprintf(stderr, "[cf] op=%u exec(addr=%u count=%u seq=%03X) condExec(bool=%u cond=%u) condJmp(addr=%u uncond=%u pred=%u bool=%u cond=%u)\n",
++                    uint32_t(cfInstr.opcode), uint32_t(cfInstr.exec.address), uint32_t(cfInstr.exec.count), uint32_t(cfInstr.exec.sequence),
++                    uint32_t(cfInstr.condExec.boolAddress), uint32_t(cfInstr.condExec.condition),
++                    uint32_t(cfInstr.condJmp.address), uint32_t(cfInstr.condJmp.isUnconditional), uint32_t(cfInstr.condJmp.isPredicated),
++                    uint32_t(cfInstr.condJmp.boolAddress), uint32_t(cfInstr.condJmp.condition));
++            }
+             switch (cfInstr.opcode)
+             {
+             case ControlFlowOpcode::Exec:
+@@ -1630,7 +1833,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 address = cfInstr.condExec.address;
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++                // Real Steel (2026-09-02): these clauses only execute when the
++                // bool constant matches `condition` (upstream ran them
++                // unconditionally). The skinning VS gates its 4-bone clauses
++                // on g_bCurNumBones4 this way; running them for 1-bone meshes
++                // picked the 0xFF padding index and collapsed every robot.
++                indent();
++                println("if (g_Bool({}) {}= 0)", uint32_t(cfInstr.condExec.boolAddress), cfInstr.condExec.condition ? "!" : "=");
++                indent();
++                out += "{\n";
++                ++indentation;
++                condExecGuard = true;
+                 break;
+ 
+             case ControlFlowOpcode::CondExecPred:
+@@ -1694,11 +1908,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     }
+                     else
+                     {
+-                        auto findResult = boolConstants.find(cfInstr.condJmp.boolAddress);
+-                        if (findResult != boolConstants.end())
+-                            println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+-                        else
+-                            println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                        // Real Steel: boolAddress is absolute in the 256-bit
++                        // hardware bool space; g_Bool handles both stages.
++                        println("if (g_Bool({}) {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                     }
+ 
+                     if (simpleControlFlow)
+@@ -1792,6 +2004,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 instructionCode += 3;
+             }
+ 
++            if (condExecGuard)
++            {
++                // Close the bool guard before any end-of-shader epilogue: a
++                // CondExecEnd still terminates the program when skipped.
++                --indentation;
++                indent();
++                out += "}\n";
++            }
++
+             if (shouldReturn)
+             {
+                 if (isPixelShader)
+@@ -1832,6 +2053,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     if (!hasMtxProjection)
+                 #endif
+                     {
++                        // Real Steel (2026-09-05): viewport transform
++                        // disabled (D3DRS_VIEWPORTENABLE = FALSE) - the
++                        // title's post-process quads emit pixel coordinates;
++                        // the host sets g_ViewportScale per draw (zero when
++                        // the viewport transform is on).
++                        out += "\tif (g_ViewportScale.x != 0.0) oPos.xy = oPos.xy * g_ViewportScale.xy + g_ViewportScale.zw * oPos.w;\n";
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+                     }
+                 }
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..a8e4f5e 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -21,10 +21,32 @@ struct StringBuffer
+     }
+ };
+ 
++// Real Steel (2026-08-29): one record per vertex-fetch instruction, exported
++// into the shader cache so the offline replayer can build native vertex-input
++// state (the container's VertexElement carries no data format).
++struct VertexFetchRecord
++{
++    uint32_t usage;       // DeclUsage, 0xFF when the element lookup missed
++    uint32_t usageIndex;
++    uint32_t offset;      // dwords into the stream (raw field; see flags bit0)
++    uint32_t stride;      // dwords
++    uint32_t format;      // Xenos vertex data format (6 bits)
++    uint32_t flags;       // bit0 mini-fetch (offset/stride/format inherited),
++                          // bit1 signedRfModeAll, bit2 numFormatAll,
++                          // bit3 formatCompAll
++};
++
+ struct ShaderRecompiler : StringBuffer
+ {
+     uint32_t indentation = 0;
+     bool isPixelShader = false;
++    std::vector<VertexFetchRecord> vertexFetches;
++    // Running vfetch state for resolving mini-fetches (which inherit
++    // format/stride from the last full fetch and continue at the next dword).
++    uint32_t lastVfetchEnd = 0;
++    uint32_t lastVfetchStride = 0;
++    uint32_t lastVfetchFormat = 0;
++    uint32_t lastVfetchFlags = 0;
+     const uint8_t* constantTableData = nullptr;
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
+     std::unordered_map<uint32_t, std::string> interpolators;
+@@ -45,6 +67,15 @@ struct ShaderRecompiler : StringBuffer
+             out += '\t';
+     }
+ 
++    // Real Steel (2026-10-02): the container is an on-disk vertex shader
++    // whose vfetch block the game rewrites per vertex declaration. Fetches are
++    // emitted with a runtime destination swizzle (g_FetchSwizzle(n), n = the
++    // fetch's ordinal in this file) and recorded as templates (flags bit 31,
++    // ordinal bits 16-19, destination register bits 8-13, keep-lane mask bits
++    // 4-7); the renderer fills swizzle/format/offset from the live block.
++    bool vertexTemplate = false;
++    uint32_t templateFetchCount = 0;
++
+     void printDstSwizzle(uint32_t dstSwizzle, bool operand);
+     void printDstSwizzle01(uint32_t dstRegister, uint32_t dstSwizzle);
+ 

@@ -1,0 +1,365 @@
+# Manual codegen overrides for realsteel
+# Merged into the entrypoint config via [entrypoint].includes in realsteel_manifest.toml
+
+# --- Codegen performance options ---
+# Emit PPC registers as C++ locals instead of context-struct loads/stores,
+# letting Clang keep them in host registers. Verify via the runtime log line
+# "Codegen config: ...". skip_lr intentionally left off (riskier; enable last
+# and only after a full playtest).
+skip_msr = true
+ctr_as_local = true
+xer_as_local = true
+cr_as_local = true
+# reserved_as_local = true  # BREAKS BOOT: r13 (TLS/PCR pointer) must live in
+# context — enabling this causes "guest access violation: read of 0x00000064"
+# at module launch.
+reserved_as_local = false
+# non_argument/non_volatile as locals BREAK this binary: it uses shared
+# savegpr/restgpr stubs that pass r12 and r14-r31 across function boundaries
+# through the context. Localizing them causes wandering near-NULL access
+# violations at module launch (seen: 0x64, 0x580).
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# --- Found during initial codegen validation ---
+
+# Orphaned code region: `b 0x8209ADD8` from 0x8209ADF0 targeted a region
+# not claimed by any function during analysis.
+[functions."0x8209ADD8"]
+name = "sub_8209ADD8"
+
+# --- Found at runtime (unregistered function crashes) ---
+
+[functions."0x822C2AF8"]
+name = "sub_822C2AF8"
+
+[functions."0x821B2970"]
+name = "sub_821B2970"
+
+[functions."0x821BBC70"]
+name = "sub_821BBC70"
+
+[functions."0x822BD0F0"]
+name = "sub_822BD0F0"
+
+[functions."0x823145D0"]
+name = "sub_823145D0"
+
+[functions."0x822C4610"]
+name = "sub_822C4610"
+
+# --- Batch: missing vtable entries found by tools/360tools/find_missing_vtable_funcs.py ---
+# Scanned work/rs_pe.bin against generated/default_final/realsteel_init.cpp.
+# Entries marked "thunk" are 2-instruction C++ virtual adjustor thunks.
+
+[functions."0x82088BEC"]
+name = "sub_82088BEC"
+[functions."0x82088D78"]
+name = "sub_82088D78"
+[functions."0x82088D84"]
+name = "sub_82088D84"
+[functions."0x8208BEB0"]
+name = "sub_8208BEB0"
+[functions."0x8208BED0"]
+name = "sub_8208BED0"
+[functions."0x8208BEE0"]
+name = "sub_8208BEE0"
+[functions."0x8208C4B0"]
+name = "sub_8208C4B0"
+[functions."0x8208CC80"]
+name = "sub_8208CC80"
+[functions."0x8208CD94"]
+name = "sub_8208CD94"
+[functions."0x8208CF74"]
+name = "sub_8208CF74"
+[functions."0x8208D0FC"]
+name = "sub_8208D0FC"
+[functions."0x8208D124"]
+name = "sub_8208D124"
+[functions."0x8208D684"]
+name = "sub_8208D684"
+[functions."0x8208D6A4"]
+name = "sub_8208D6A4"
+[functions."0x8208D6B4"]
+name = "sub_8208D6B4"
+[functions."0x8208D81C"]
+name = "sub_8208D81C"
+[functions."0x8208D82C"]
+name = "sub_8208D82C"
+[functions."0x8208D838"]
+name = "sub_8208D838"
+[functions."0x8208D948"]
+name = "sub_8208D948"
+[functions."0x8208D968"]
+name = "sub_8208D968"
+[functions."0x8208D974"]
+name = "sub_8208D974"
+[functions."0x8209AD60"]
+name = "sub_8209AD60"
+[functions."0x8209AD70"]
+name = "sub_8209AD70"
+[functions."0x8209AD80"]
+name = "sub_8209AD80"
+[functions."0x8209AD90"]
+name = "sub_8209AD90"
+[functions."0x8209ADA0"]
+name = "sub_8209ADA0"
+[functions."0x8209B340"]
+name = "sub_8209B340"
+[functions."0x82148D10"]
+name = "sub_82148D10"
+# thunk: addi r3,272; b 0x8217DD40
+[functions."0x82171470"]
+name = "sub_82171470"
+[functions."0x82171478"]
+name = "sub_82171478"
+[functions."0x8217C0D0"]
+name = "sub_8217C0D0"
+[functions."0x821B5498"]
+name = "sub_821B5498"
+[functions."0x821E1E00"]
+name = "sub_821E1E00"
+[functions."0x82229E1C"]
+name = "sub_82229E1C"
+[functions."0x82229ECC"]
+name = "sub_82229ECC"
+[functions."0x8222A010"]
+name = "sub_8222A010"
+[functions."0x8222A124"]
+name = "sub_8222A124"
+[functions."0x8222EFE0"]
+name = "sub_8222EFE0"
+[functions."0x8222EFEC"]
+name = "sub_8222EFEC"
+[functions."0x8222EFFC"]
+name = "sub_8222EFFC"
+[functions."0x8222F170"]
+name = "sub_8222F170"
+[functions."0x8222F1BC"]
+name = "sub_8222F1BC"
+[functions."0x8222F2B4"]
+name = "sub_8222F2B4"
+[functions."0x8222F2BC"]
+name = "sub_8222F2BC"
+[functions."0x8222F2C8"]
+name = "sub_8222F2C8"
+[functions."0x82232140"]
+name = "sub_82232140"
+[functions."0x82232188"]
+name = "sub_82232188"
+[functions."0x82232660"]
+name = "sub_82232660"
+[functions."0x822326AC"]
+name = "sub_822326AC"
+[functions."0x82232D34"]
+name = "sub_82232D34"
+[functions."0x82232DC4"]
+name = "sub_82232DC4"
+[functions."0x82233F14"]
+name = "sub_82233F14"
+[functions."0x82233F98"]
+name = "sub_82233F98"
+[functions."0x82234120"]
+name = "sub_82234120"
+[functions."0x82234174"]
+name = "sub_82234174"
+[functions."0x822341D4"]
+name = "sub_822341D4"
+[functions."0x822341EC"]
+name = "sub_822341EC"
+[functions."0x822361D4"]
+name = "sub_822361D4"
+[functions."0x82236208"]
+name = "sub_82236208"
+[functions."0x822362F4"]
+name = "sub_822362F4"
+[functions."0x8223635C"]
+name = "sub_8223635C"
+[functions."0x82236390"]
+name = "sub_82236390"
+[functions."0x822364B0"]
+name = "sub_822364B0"
+[functions."0x82236C40"]
+name = "sub_82236C40"
+[functions."0x82236C88"]
+name = "sub_82236C88"
+[functions."0x82236ED8"]
+name = "sub_82236ED8"
+[functions."0x82236EE4"]
+name = "sub_82236EE4"
+[functions."0x82236FF8"]
+name = "sub_82236FF8"
+[functions."0x82237058"]
+name = "sub_82237058"
+[functions."0x82237268"]
+name = "sub_82237268"
+[functions."0x822372A0"]
+name = "sub_822372A0"
+[functions."0x822B8648"]
+name = "sub_822B8648"
+[functions."0x822B8650"]
+name = "sub_822B8650"
+[functions."0x822B8660"]
+name = "sub_822B8660"
+# thunk: addi r3,-8; b 0x822B8910
+[functions."0x822BADE0"]
+name = "sub_822BADE0"
+# thunk: addi r3,-4; b 0x822C3E50
+[functions."0x822BD0C8"]
+name = "sub_822BD0C8"
+# thunk: addi r3,-4; b 0x822BCFD0
+[functions."0x822BD0D0"]
+name = "sub_822BD0D0"
+# thunk: addi r3,-4; b 0x822BD1D0
+[functions."0x822BD0D8"]
+name = "sub_822BD0D8"
+# thunk: addi r3,-4; b 0x822BCFF8
+[functions."0x822BD0E8"]
+name = "sub_822BD0E8"
+# thunk: addi r3,-4; b 0x822BC0A0
+[functions."0x822BD148"]
+name = "sub_822BD148"
+# thunk: addi r3,-4; b 0x822C2A98
+[functions."0x822C2AC0"]
+name = "sub_822C2AC0"
+# thunk: addi r3,-4; b 0x822C2A90
+[functions."0x822C2AC8"]
+name = "sub_822C2AC8"
+# thunk: addi r3,-4; b 0x822C2C48
+[functions."0x822C2AD0"]
+name = "sub_822C2AD0"
+# thunk: addi r3,-4; b 0x822C2A88
+[functions."0x822C2AE0"]
+name = "sub_822C2AE0"
+# thunk: addi r3,-4; b 0x822C2A80
+[functions."0x822C2AE8"]
+name = "sub_822C2AE8"
+# thunk: addi r3,-4; b 0x822BCFF0
+[functions."0x822C2AF0"]
+name = "sub_822C2AF0"
+# thunk: addi r3,-4; b 0x822C3E48
+[functions."0x822C3E80"]
+name = "sub_822C3E80"
+# thunk: addi r3,-4; b 0x822C4010
+[functions."0x822C3E88"]
+name = "sub_822C3E88"
+# thunk: addi r3,-4; b 0x822C3E40
+[functions."0x822C3E98"]
+name = "sub_822C3E98"
+# thunk: addi r3,-4; b 0x822C3E58
+[functions."0x822C3EA0"]
+name = "sub_822C3EA0"
+# thunk: addi r3,-4; b 0x822BCFC8
+[functions."0x822C3EA8"]
+name = "sub_822C3EA8"
+# thunk: addi r3,-4; b 0x822BCFB8
+[functions."0x822C3EB0"]
+name = "sub_822C3EB0"
+[functions."0x822C3EB8"]
+name = "sub_822C3EB8"
+# thunk: addi r3,-16; b 0x822C43D8
+[functions."0x822C5140"]
+name = "sub_822C5140"
+# thunk: addi r3,-32; b 0x822C5D40
+[functions."0x822C5F08"]
+name = "sub_822C5F08"
+[functions."0x822C8D70"]
+name = "sub_822C8D70"
+[functions."0x822D36B4"]
+name = "sub_822D36B4"
+[functions."0x822D36D0"]
+name = "sub_822D36D0"
+[functions."0x822D62B8"]
+name = "sub_822D62B8"
+[functions."0x822D62C0"]
+name = "sub_822D62C0"
+[functions."0x822D62D0"]
+name = "sub_822D62D0"
+# thunk: addi r3,-4; b 0x822D7730
+[functions."0x822D7A58"]
+name = "sub_822D7A58"
+# thunk: addi r3,-4; b 0x822D78F0
+[functions."0x822D7A68"]
+name = "sub_822D7A68"
+# thunk: addi r3,-4; b 0x8210F7E8
+[functions."0x822D9398"]
+name = "sub_822D9398"
+# thunk: addi r3,-4; b 0x822D9208
+[functions."0x822D93B8"]
+name = "sub_822D93B8"
+# thunk: addi r3,-4; b 0x822D92A0
+[functions."0x822D93C0"]
+name = "sub_822D93C0"
+[functions."0x8230E640"]
+name = "sub_8230E640"
+[functions."0x82324B10"]
+name = "sub_82324B10"
+[functions."0x823642DC"]
+name = "sub_823642DC"
+[functions."0x823642F4"]
+name = "sub_823642F4"
+[functions."0x82364300"]
+name = "sub_82364300"
+# thunk: addi r3,-28; b 0x823BE620
+[functions."0x823BE610"]
+name = "sub_823BE610"
+[functions."0x823C0550"]
+name = "sub_823C0550"
+# thunk: addi r3,-28; b 0x823C0798
+[functions."0x823C0560"]
+name = "sub_823C0560"
+[functions."0x82414AAC"]
+name = "sub_82414AAC"
+[functions."0x82414AC8"]
+name = "sub_82414AC8"
+[functions."0x82414C88"]
+name = "sub_82414C88"
+[functions."0x82414C9C"]
+name = "sub_82414C9C"
+[functions."0x82414FE8"]
+name = "sub_82414FE8"
+[functions."0x82415000"]
+name = "sub_82415000"
+[functions."0x824151B4"]
+name = "sub_824151B4"
+[functions."0x824153B0"]
+name = "sub_824153B0"
+[functions."0x824157F8"]
+name = "sub_824157F8"
+[functions."0x82415844"]
+name = "sub_82415844"
+[functions."0x82415C64"]
+name = "sub_82415C64"
+[functions."0x82415CB8"]
+name = "sub_82415CB8"
+[functions."0x82415CEC"]
+name = "sub_82415CEC"
+[functions."0x82415D04"]
+name = "sub_82415D04"
+[functions."0x82416408"]
+name = "sub_82416408"
+[functions."0x82416428"]
+name = "sub_82416428"
+[functions."0x82416560"]
+name = "sub_82416560"
+[functions."0x824166AC"]
+name = "sub_824166AC"
+
+# --- ReXCRT: native SIMD replacements for statically-linked LIBCMT leaves ---
+# Identified via tools/360tools/find_crt_funcs.py and confirmed by reading the
+# PPC disassembly. Both are textbook leaf routines in the CRT cluster at
+# 0x82229xxx. The SDK's Memory group provides native host implementations.
+#   memset  0x82229D00: byte-splat rlwimi r4,r4 + 16-byte-unrolled stw loop.
+#   memcpy  0x822297D0: dst-align + lbzu/stbu head, word/128-byte block copy.
+# memmove not found as a separate function (optional; game appears to use memcpy).
+[rexcrt]
+memset = 0x82229D00
+memcpy = 0x822297D0
+
+# --- Guest frame timing probe at the VdSwap call site ---
+# Fires on the guest thread just before the single VdSwap call (bl at
+# 0x82250670, in realsteel_recomp.31.cpp). Body in src/realsteel_hooks.cpp.
+# The default is uncapped; realsteel_guest_fps_cap can opt into pacing.
+[[midasm_hook]]
+address = 0x82250670
+name = "RealSteelSwapHook"

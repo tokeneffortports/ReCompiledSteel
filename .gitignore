@@ -1,0 +1,32 @@
+# Your copy of the game and everything made from it - never committed.
+/work/
+/generated/default_final/
+/generated/shader_cache.cpp
+/game/
+/tu/
+
+# Build outputs
+/out/
+/release/
+/build/
+/tools/replayer/build/
+/tools/setup/build/
+/thirdparty/XenosRecomp/
+
+# Robot mods you make or install while developing
+/mods/
+
+# Run-time files the game writes beside itself
+*.log
+realsteel_settings.cfg
+rs_native/
+rs_captures/
+rs_shaders/
+rs_textures/
+rs_native_print.log
+
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
