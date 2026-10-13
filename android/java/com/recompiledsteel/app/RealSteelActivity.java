@@ -1,6 +1,8 @@
 package com.recompiledsteel.app;
 
+import android.content.pm.ActivityInfo;
 import android.os.Bundle;
+import android.system.Os;
 import android.util.Log;
 
 import org.libsdl.app.SDLActivity;
@@ -44,7 +46,31 @@ public class RealSteelActivity extends SDLActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         RunState.started(this);
+        // A custom GPU driver only when the player chose one in the launcher;
+        // otherwise the variables are cleared and the game uses the system one.
+        File driver = GpuDriver.selected(this);
+        try {
+            if (driver != null) {
+                Log.w(TAG, "custom GPU driver chosen: " + GpuDriver.label(this));
+                Os.setenv("REALSTEEL_GPU_DRIVER", driver.getAbsolutePath(), true);
+                Os.setenv("REALSTEEL_GPU_DRIVER_LABEL", GpuDriver.name(this), true);
+                Os.setenv("REALSTEEL_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir, true);
+            } else {
+                Os.unsetenv("REALSTEEL_GPU_DRIVER");
+                Os.unsetenv("REALSTEEL_GPU_DRIVER_LABEL");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "could not pass the GPU driver choice: " + e);
+        }
         super.onCreate(savedInstanceState);
+    }
+
+    // The game is landscape only (either way up). SDL would otherwise ask
+    // for any orientation because the window is resizable, which on a phone
+    // (portrait by nature, rotation locked) starts the game sideways.
+    @Override
+    public void setOrientationBis(int w, int h, boolean resizable, String hint) {
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
     }
 
     @Override

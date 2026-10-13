@@ -75,6 +75,12 @@ Mode**. It holds 60 fps. Saves are in `~/.local/share/realsteel`.
 A built-in controller works as-is, and touch controls appear when no
 controller is connected. More in [android/README.md](android/README.md).
 
+**Graphics driver** (Qualcomm/Adreno devices): the game uses the device's own
+driver. The launcher can load a custom Vulkan driver file you choose instead,
+through [libadrenotools](https://github.com/bylaws/libadrenotools). It is off
+unless you pick a file, entirely at your own risk, and not supported by this
+project: check any problem with the system driver before reporting it.
+
 ### Windows SmartScreen
 
 The release is not digitally signed, so Windows may warn the first time. If
@@ -179,8 +185,9 @@ for your PC, Steam Deck or handheld, this is for you.
 ## Reporting problems
 
 Open an [issue](https://github.com/tokeneffortports/ReCompiledSteel/issues)
-with the newest `rex_latest.log` from next to the program
-(`RealSteel/logs/` on Android), and say what you were doing when it happened.
+with the newest `rex_latest.log` from next to the program, and say what you
+were doing when it happened. On Android, press **Save diagnostics** in the
+launcher and attach the zip it writes to `RealSteel/logs/`.
 
 ## Building it yourself
 
@@ -211,6 +218,7 @@ Step by step: [docs/building.md](docs/building.md).
 - Libraries, all downloaded by the build or part of the SDK (none are kept in
   this repository): [volk](https://github.com/zeux/volk), [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers),
   [zstd](https://github.com/facebook/zstd), [smol-v](https://github.com/aras-p/smol-v),
+  [libadrenotools](https://github.com/bylaws/libadrenotools) (Android),
   and through the SDK [Dear ImGui](https://github.com/ocornut/imgui), [SDL3](https://github.com/libsdl-org/SDL),
   FFmpeg and more. Every one, with its
   licence, is in [packaging/licenses](packaging/licenses/THIRD-PARTY-LICENSES.txt).

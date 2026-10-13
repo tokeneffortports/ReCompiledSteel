@@ -1,5 +1,6 @@
 #include "realsteel_native_present.h"
 
+#include "realsteel_gpu_driver.h"
 #include "realsteel_overlay.h"
 #include "realsteel_shader_dump.h"
 #include "realsteel_texture_dump.h"
@@ -365,13 +366,18 @@ void WorkerMain() {
   options.pipeline_cache_path = "rs_pipeline_cache.bin";
   options.textures_dir = "rs_textures";
   options.use_cull = true;
+  realsteel::gpu_driver::Apply();  // a player-chosen Android driver, if any
   auto renderer = std::make_unique<rs::vk::Renderer>();
   if (!renderer->Init(options)) {
     std::fflush(stdout);  // the backend's reason is in rs_native_print.log
     REXLOG_INFO("[native-present] renderer init FAILED — disabled (reason: rs_native_print.log)");
+    if (!rs::vk::DriverDescription().empty()) {
+      REXLOG_INFO("[native-present] GPU {}", rs::vk::DriverDescription());
+    }
     g_failed.store(true);
     return;
   }
+  REXLOG_INFO("[native-present] GPU {}", rs::vk::DriverDescription());
 #ifdef _WIN32
   {
     DEVMODEW mode{};

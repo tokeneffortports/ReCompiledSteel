@@ -166,6 +166,7 @@ the rest is fetched for you, at pinned versions:
 | numpy | the mod tools only | `pip install numpy` |
 | Android NDK, SDK, JDK 17 | the Android build only | `android/dev/setup_toolchain.sh` (you accept Google's licences there) |
 | ReXGlue SDK source at `509ed5b` | the Android build only | `android/build_sdk.sh` clones it and applies `thirdparty/rexglue-android.patch` |
+| [libadrenotools](https://github.com/bylaws/libadrenotools) `8fae8ce` | the Android launcher's optional custom GPU driver | downloaded by CMake on the first Android configure |
 
 The first configure needs an internet connection for the CMake downloads. The
 release packages carry every licence these components require

@@ -63,6 +63,13 @@ echo "== Native libraries (stripped) =="
 "$STRIP" --strip-debug -o "$WORK/pkg/lib/arm64-v8a/libmain.so" "$LIBMAIN"
 "$STRIP" --strip-debug -o "$WORK/pkg/lib/arm64-v8a/librexruntime.so" "$REX_ANDROID/lib/librexruntime.so"
 cp "$LIBCXX" "$WORK/pkg/lib/arm64-v8a/"
+# libadrenotools and its hooks (optional custom GPU driver; only loaded when
+# a player chooses a driver in the launcher, see src/realsteel_gpu_driver.cpp).
+for lib in libadrenotools.so libhook_impl.so libmain_hook.so; do
+    found=$(find "$(dirname "$LIBMAIN")" -name "$lib" -print -quit)
+    [[ -n "$found" ]] || { echo "missing $lib (android/build_android.sh builds it)" >&2; exit 1; }
+    "$STRIP" --strip-debug -o "$WORK/pkg/lib/arm64-v8a/$lib" "$found"
+done
 # The crash catcher, loaded before everything else (android/native/rscrash.c).
 "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --target=aarch64-linux-android30     -shared -fPIC -O2 -funwind-tables -Wl,-z,max-page-size=16384     -o "$WORK/pkg/lib/arm64-v8a/librscrash.so" "$SCRIPT_DIR/native/rscrash.c" -llog
 # The installer: the PC setup programs' code (tools/setup) behind a JNI bridge

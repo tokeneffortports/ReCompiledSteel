@@ -29,9 +29,21 @@ no controller connected, on-screen touch controls appear (Settings, Controls,
 Touch controls: Automatic / On / Off); their "..." button opens the settings
 page, which on a controller opens with L3 + R3.
 
-Logs are written to `RealSteel/logs/`. If something goes wrong, the newest
-`realsteel_*.log` there is what to send. Settings (F1 page on the PC) are
-saved in `RealSteel/realsteel_settings.cfg`.
+Logs are written to `RealSteel/logs/`. If something goes wrong, press
+**Save diagnostics** in the launcher and send the zip it writes there (the
+app's log, the newest game logs, the renderer's log, any crash report and
+the settings). After a start that fails the launcher saves one by itself.
+Settings (F1 page on the PC) are saved in `RealSteel/realsteel_settings.cfg`.
+
+Graphics driver: the game uses the device's own Vulkan driver. On
+Qualcomm (Adreno) devices **Graphics driver** in the launcher can load a
+custom driver file you choose (a `.so`, or a driver zip with a `meta.json`)
+through libadrenotools. It is off unless you choose a file, entirely at your
+own risk and unsupported: the driver runs inside the app with its file
+access, and problems should be checked with the system driver before they
+are reported. **Use system driver** undoes it; after a failed start on a
+custom driver the launcher offers that too. Every log names the driver in
+use (`[gpu-driver]` and `[native-present] GPU` lines).
 
 ## Building
 
@@ -67,7 +79,13 @@ go), `nova_run.sh` (install, start and collect the log over adb),
 - Game: the renderer creates a `VK_KHR_android_surface`; everything lives
   in `/sdcard/RealSteel` instead of beside the executable; the game is a
   shared library (`libmain.so`) loaded by SDL's activity
-  (`java/com/recompiledsteel/app/RealSteelActivity.java`).
+  (`java/com/recompiledsteel/app/RealSteelActivity.java`), which keeps it
+  in landscape; the swapchain is presented unrotated at the window's size
+  (phones are portrait by nature, and Android turns the picture).
+- Optional custom GPU driver: `libadrenotools.so`, `libhook_impl.so` and
+  `libmain_hook.so` (libadrenotools, fetched by CMake) are in the APK but
+  only loaded by `src/realsteel_gpu_driver.cpp` when the launcher passes a
+  chosen driver (`REALSTEEL_GPU_DRIVER`).
 
 Prior art: luisxl15's Skate 3 Android port showed the way and listed the
 traps (credited in CREDITS.md).

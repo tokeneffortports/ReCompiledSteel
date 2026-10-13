@@ -289,6 +289,12 @@ class Renderer {
   void* backend_;  // rs::vk::(anonymous)::Backend
 };
 
+// Use a player-chosen driver's vkGetInstanceProcAddr instead of the system
+// Vulkan loader (Android custom GPU driver; call before Init). Null = system.
+void SetVulkanLoader(void* get_instance_proc_addr);
+// "<GPU>, driver <name> [<info>] (id, version, Vulkan x.y.z)" once Init ran.
+const std::string& DriverDescription();
+
 // RGBA8 -> PNG helper (also used by the texture dumper in main.cpp).
 bool WriteRgbaPngFile(const std::string& path,
                       const std::vector<uint8_t>& rgba, uint32_t width,

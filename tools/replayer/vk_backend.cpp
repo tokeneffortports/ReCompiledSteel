@@ -71,6 +71,7 @@ constexpr uint32_t kSharedSwappedTexcoords = 352;
     if (vk_check_result != VK_SUCCESS) {                            \
       std::printf("[vk] %s failed: %d (line %d)\n", #expr,          \
                   int(vk_check_result), __LINE__);                  \
+      std::fflush(stdout);                                          \
       return false;                                                 \
     }                                                               \
   } while (0)
@@ -437,6 +438,21 @@ class Backend {
   VkSemaphore render_sem_ = VK_NULL_HANDLE;
   bool swapchain_dirty_ = false;
   bool sc_extent_from_owner_ = false;  // surface has no size of its own
+#if defined(__ANDROID__)
+  // On a display that is turned from its natural orientation (a phone held
+  // in landscape) Android gives currentExtent at the window's size and
+  // currentTransform as the turn. We present unrotated (identity) at that
+  // size and the compositor turns it; using currentTransform as preTransform
+  // would ask us to draw the picture turned ourselves. SUBOPTIMAL (transform
+  // != identity) is then expected rather than a reason to rebuild, so size
+  // changes are polled instead.
+  static VkExtent2D WindowExtent(const VkSurfaceCapabilitiesKHR& caps) {
+    return caps.currentExtent;
+  }
+  static constexpr bool kRebuildOnSuboptimal = false;
+#else
+  static constexpr bool kRebuildOnSuboptimal = true;
+#endif
 
  public:
   bool WindowOpen() const { return window_open_; }
@@ -918,8 +934,18 @@ VkDeviceSize Backend::Alloc(VkDeviceSize bytes, VkDeviceSize align) {
   return at;
 }
 
+// Android, a player-chosen GPU driver (src/realsteel_gpu_driver.cpp): its
+// vkGetInstanceProcAddr replaces the system loader's. Null = system driver.
+PFN_vkGetInstanceProcAddr g_custom_loader = nullptr;
+std::string g_driver_text;
+
 bool Backend::InitVulkan(bool validation) {
-  VK_CHECK(volkInitialize());
+  if (g_custom_loader != nullptr) {
+    volkInitializeCustom(g_custom_loader);
+    std::printf("[vk] Vulkan loader: CUSTOM GPU driver (chosen in the launcher)\n");
+  } else {
+    VK_CHECK(volkInitialize());
+  }
 
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
   app.pApplicationName = "rs_replay";
@@ -1005,6 +1031,27 @@ bool Backend::InitVulkan(bool validation) {
   VkPhysicalDeviceProperties props;
   vkGetPhysicalDeviceProperties(phys_, &props);
   std::printf("[vk] using %s\n", props.deviceName);
+  {
+    // Which driver is running (bug reports): name, build, version.
+    VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &drv;
+    vkGetPhysicalDeviceProperties2(phys_, &p2);
+    char text[512];
+    std::snprintf(text, sizeof(text),
+                  "%s, driver %s [%s] (id %d, version 0x%08x, Vulkan %u.%u.%u)%s",
+                  props.deviceName, drv.driverName, drv.driverInfo, int(drv.driverID),
+                  props.driverVersion, VK_API_VERSION_MAJOR(props.apiVersion),
+                  VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion),
+                  g_custom_loader != nullptr ? " - CUSTOM DRIVER" : "");
+    // (Qualcomm's driverInfo is several lines: keep the log line whole.)
+    for (char* c = text; *c != 0; ++c) {
+      if (*c == '\n' || *c == '\r') *c = ' ';
+    }
+    g_driver_text = text;
+    std::printf("[vk] GPU %s\n", text);
+    std::fflush(stdout);
+  }
 
   uint32_t family_count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(phys_, &family_count, nullptr);
@@ -2180,6 +2227,17 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
       swapchain_dirty_ = true;
     }
   }
+#if defined(__ANDROID__)
+  if (options_.window && swapchain_ != VK_NULL_HANDLE && !swapchain_dirty_) {
+    VkSurfaceCapabilitiesKHR caps{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_, surface_, &caps) == VK_SUCCESS) {
+      const VkExtent2D e = WindowExtent(caps);
+      if (e.width != sc_extent_.width || e.height != sc_extent_.height) {
+        swapchain_dirty_ = true;
+      }
+    }
+  }
+#endif
   if (options_.window && swapchain_dirty_) {
     vkDeviceWaitIdle(device_);
     DestroySwapchain();
@@ -4051,7 +4109,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
                                                acquire_sem_, VK_NULL_HANDLE,
                                                &present_index);
     if (acq == VK_ERROR_SURFACE_LOST_KHR) surface_lost_ = true;
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) {
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR || (acq == VK_SUBOPTIMAL_KHR && kRebuildOnSuboptimal)) {
       swapchain_dirty_ = true;
     }
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) present_index = UINT32_MAX;
@@ -4212,7 +4270,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     pi.pImageIndices = &present_index;
     const VkResult pr = vkQueuePresentKHR(queue_, &pi);
     if (pr == VK_ERROR_SURFACE_LOST_KHR) surface_lost_ = true;
-    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && kRebuildOnSuboptimal)) {
       swapchain_dirty_ = true;
     }
   }
@@ -4754,6 +4812,9 @@ bool Backend::CreateSwapchain() {
                                                    : "asked for, but the display offers no HDR format - SDR");
   }
   sc_extent_ = caps.currentExtent;
+#if defined(__ANDROID__)
+  sc_extent_ = WindowExtent(caps);
+#endif
   sc_extent_from_owner_ = sc_extent_.width == 0xFFFFFFFFu;
   if (sc_extent_from_owner_) {
     // Wayland: the surface takes the size of what is presented to it.
@@ -4783,6 +4844,9 @@ bool Backend::CreateSwapchain() {
   sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
   sci.preTransform = caps.currentTransform;
+#if defined(__ANDROID__)
+  sci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;  // (Android always offers it)
+#endif
   sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
   if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) {
     for (uint32_t bit = 1; bit <= 8; bit <<= 1) {
@@ -4842,8 +4906,9 @@ bool Backend::CreateSwapchain() {
     VK_CHECK(vkCreateImageView(device_, &vci, nullptr, &sc_views_[i]));
   }
   swapchain_dirty_ = false;
-  std::printf("[vk] swapchain %ux%u, %u images\n", sc_extent_.width,
-              sc_extent_.height, n);
+  std::printf("[vk] swapchain %ux%u, %u images, display transform 0x%x\n", sc_extent_.width,
+              sc_extent_.height, n, unsigned(caps.currentTransform));
+  std::fflush(stdout);  // (startup lines reach the file even if a crash follows)
   return true;
 }
 
@@ -5371,6 +5436,12 @@ void Renderer::SetPictureAspect(float aspect) {
 void Renderer::SetAspectMask2D(bool mask) { AsBackend(backend_)->SetAspectMask2D(mask); }
 float Renderer::WindowAspect() const { return AsBackend(backend_)->WindowAspect(); }
 void Renderer::DrawListOnce() { AsBackend(backend_)->DrawListOnce(); }
+
+void SetVulkanLoader(void* get_instance_proc_addr) {
+  g_custom_loader = reinterpret_cast<PFN_vkGetInstanceProcAddr>(get_instance_proc_addr);
+}
+
+const std::string& DriverDescription() { return g_driver_text; }
 void Renderer::ProfileGpu(uint32_t frames) { AsBackend(backend_)->ProfileGpu(frames); }
 void Renderer::LastReadbackSize(uint32_t& width, uint32_t& height) const {
   AsBackend(backend_)->LastReadbackSize(width, height);

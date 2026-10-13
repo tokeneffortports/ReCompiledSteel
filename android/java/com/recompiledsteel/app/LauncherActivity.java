@@ -8,11 +8,13 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
@@ -45,6 +47,7 @@ import java.util.Map;
  */
 public class LauncherActivity extends Activity {
     private static final int PICK_FOLDER = 1;
+    private static final int PICK_DRIVER = 2;
 
     private static final int BACKGROUND = Color.rgb(12, 16, 20);
     private static final int CARD = Color.rgb(22, 28, 34);
@@ -140,9 +143,11 @@ public class LauncherActivity extends Activity {
         access = addButton(buttons, "Allow file access", true, v -> askFileAccess());
         start = addButton(buttons, "Start", true, v -> startGame());
         install = addButton(buttons, "Install game files", false, v -> pickFolder());
+        addButton(buttons, "Graphics driver", false, v -> driverMenu());
         addButton(buttons, "Save diagnostics", false, v -> {
-            File saved = RunState.saveLogcat(this, "logcat");
+            File saved = RunState.saveDiagnostics(this, "diagnostics");
             crashNote = saved != null ? "Diagnostics saved: " + saved.getAbsolutePath()
+                                        + "\nAttach this zip to a bug report."
                                       : "Could not save diagnostics.";
             refresh();
         });
@@ -242,7 +247,7 @@ public class LauncherActivity extends Activity {
             }
         }
         if (!failed) return;
-        File saved = RunState.saveLogcat(this, "logcat_failed_start");
+        File saved = RunState.saveDiagnostics(this, "diagnostics_failed_start");
         StringBuilder note = new StringBuilder(why).append("\n");
         note.append(saved != null ? "Diagnostics saved: " + saved.getAbsolutePath()
                                   : "Diagnostics could not be saved.");
@@ -256,6 +261,20 @@ public class LauncherActivity extends Activity {
                 note.append("\n\n").append(last.length() > 1800 ? last.substring(0, 1800) : last);
             } catch (Exception ignored) {
             }
+        }
+        if (GpuDriver.selected(this) != null) {
+            note.append("\n\nA custom graphics driver was in use (").append(GpuDriver.label(this))
+                .append("). It may be the cause: try the system driver (Graphics driver > Use system driver).");
+            new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Custom graphics driver")
+                .setMessage("The last start failed while a custom graphics driver was in use:\n\n"
+                            + GpuDriver.label(this) + "\n\nSwitch back to the system driver?")
+                .setPositiveButton("Use system driver", (d, w) -> {
+                    GpuDriver.useSystem(this);
+                    refresh();
+                })
+                .setNegativeButton("Keep it", null)
+                .show();
         }
         crashNote = note.toString();
         RunState.write(this, "run_state", "reported");
@@ -289,6 +308,9 @@ public class LauncherActivity extends Activity {
                  update ? "installed" : "not installed (required)");
             line(text, addons > 0 ? GOOD : MUTED, "Add-ons", addons > 0 ? addons + " installed" : "none (optional)");
         }
+        boolean custom = GpuDriver.selected(this) != null;
+        line(text, custom ? WARN : MUTED, "Graphics driver",
+             custom ? GpuDriver.label(this) + " - at your own risk" : GpuDriver.label(this));
         if (text.length() > 0) text.delete(text.length() - 1, text.length());
         status.setText(text);
 
@@ -345,9 +367,84 @@ public class LauncherActivity extends Activity {
         }
     }
 
+    // --------------------------------------------------------- graphics driver
+
+    private static final String DRIVER_WARNING =
+        "Custom graphics drivers are not made, tested or supported by ReCompiled Steel.\n\n"
+        + "Using one is entirely your own choice and at your own risk. A driver can make the game "
+        + "crash, display incorrectly or behave unpredictably, and it runs inside this app with the "
+        + "same file access the app has. Only use a driver from a source you trust.\n\n"
+        + "If anything goes wrong while a custom driver is in use, that is down to the driver and "
+        + "your choice to use it, not ReCompiled Steel. Please check problems with the system "
+        + "driver before reporting them.\n\n"
+        + "You can switch back to the system driver here at any time.";
+
+    private void driverMenu() {
+        boolean custom = GpuDriver.selected(this) != null;
+        AlertDialog.Builder menu = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Graphics driver")
+            .setMessage("In use: " + GpuDriver.label(this) + "\n\nThe game uses this device's own "
+                        + "(system) graphics driver unless you choose a custom driver file.")
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton(custom ? "Choose another file" : "Choose a driver file", (d, w) -> driverWarning());
+        if (custom) {
+            menu.setPositiveButton("Use system driver", (d, w) -> {
+                GpuDriver.useSystem(this);
+                crashNote = "The system graphics driver will be used.";
+                refresh();
+            });
+        }
+        menu.show();
+    }
+
+    private void driverWarning() {
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Use a custom driver at your own risk")
+            .setMessage(DRIVER_WARNING)
+            .setPositiveButton("I understand, choose a file", (d, w) -> {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                try {
+                    startActivityForResult(intent, PICK_DRIVER);
+                } catch (Exception e) {
+                    message.setText("This device has no file picker: " + e.getMessage());
+                }
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private String displayName(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri, new String[] {OpenableColumns.DISPLAY_NAME},
+                                                   null, null, null)) {
+            if (c != null && c.moveToFirst()) return c.getString(0);
+        } catch (Exception ignored) {
+        }
+        String last = uri.getLastPathSegment();
+        return last != null ? last : "driver";
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_DRIVER) {
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+            Uri uri = data.getData();
+            String name = displayName(uri);
+            message.setText("Reading " + name + " ...");
+            new Thread(() -> {
+                String error = GpuDriver.install(this, uri, name);
+                runOnUiThread(() -> {
+                    crashNote = error.isEmpty()
+                        ? "Custom graphics driver set: " + GpuDriver.label(this)
+                          + "\nIt is used from the next Start. Graphics driver > Use system driver undoes it."
+                        : "The driver was not set. " + error;
+                    refresh();
+                });
+            }, "RS driver").start();
+            return;
+        }
         if (requestCode != PICK_FOLDER) return;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
             message.setText("");

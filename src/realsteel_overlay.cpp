@@ -149,8 +149,12 @@ const std::vector<Setting>& Settings() {
        Kind::kChoice, "1280x720",
        "Resolution the game is rendered at before it is scaled to the screen "
        "(the height follows the aspect ratio). 720p is the native resolution "
-       "of the Steam Deck and Retroid Pocket Nova panels.",
-       {{"720p (original; Nova and Deck native)", "1280x720"},
+       "of the Steam Deck and Retroid Pocket Nova panels. Below 720p is for "
+       "slower devices: faster, but softer than the original.",
+       {{"360p (fastest)", "640x360"},
+        {"480p (faster)", "854x480"},
+        {"540p (faster)", "960x540"},
+        {"720p (original; Nova and Deck native)", "1280x720"},
         {"900p (1.25x)", "1600x900"},
         {"1080p (1.5x)", "1920x1080"},
         {"1440p (2x)", "2560x1440"},

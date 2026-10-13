@@ -173,6 +173,43 @@ target_compile_definitions(rs_zstd_dec PRIVATE ZSTD_DISABLE_ASM)
 add_library(rs_smolv STATIC "${smolv_SOURCE_DIR}/source/smolv.cpp")
 target_include_directories(rs_smolv PUBLIC "${smolv_SOURCE_DIR}/source")
 
+# Android, optional custom GPU driver (launcher: "Graphics driver"). Three
+# libraries that only load when a player has chosen a driver file: the game
+# dlopens libadrenotools.so then, which loads the two hooks. Not linked to
+# the game, so with the system driver none of this code runs.
+if(ANDROID)
+    FetchContent_Declare(adrenotools
+        GIT_REPOSITORY https://github.com/bylaws/libadrenotools
+        GIT_TAG 8fae8ce254dfc1344527e05301e43f37dea2df80
+        GIT_SUBMODULES lib/linkernsbypass
+        SOURCE_SUBDIR sources-only)
+    FetchContent_MakeAvailable(adrenotools)
+    set(RS_LNSB "${adrenotools_SOURCE_DIR}/lib/linkernsbypass")
+    add_library(rs_linkernsbypass STATIC
+        "${RS_LNSB}/android_linker_ns.cpp" "${RS_LNSB}/elf_soname_patcher.cpp")
+    target_include_directories(rs_linkernsbypass PUBLIC "${RS_LNSB}")
+    set_target_properties(rs_linkernsbypass PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(rs_linkernsbypass PUBLIC android dl)
+    add_library(rs_adrenotools SHARED "${adrenotools_SOURCE_DIR}/src/driver.cpp")
+    set_target_properties(rs_adrenotools PROPERTIES OUTPUT_NAME adrenotools)
+    target_include_directories(rs_adrenotools PRIVATE
+        "${adrenotools_SOURCE_DIR}/include" "${adrenotools_SOURCE_DIR}/src")
+    target_link_libraries(rs_adrenotools PRIVATE rs_linkernsbypass log)
+    add_library(rs_adrenotools_hook_impl SHARED "${adrenotools_SOURCE_DIR}/src/hook/hook_impl.cpp")
+    set_target_properties(rs_adrenotools_hook_impl PROPERTIES OUTPUT_NAME hook_impl
+                          CXX_VISIBILITY_PRESET hidden)
+    target_include_directories(rs_adrenotools_hook_impl PRIVATE "${adrenotools_SOURCE_DIR}/include")
+    target_link_libraries(rs_adrenotools_hook_impl PRIVATE rs_linkernsbypass log)
+    add_library(rs_adrenotools_main_hook SHARED "${adrenotools_SOURCE_DIR}/src/hook/main_hook.c")
+    set_target_properties(rs_adrenotools_main_hook PROPERTIES OUTPUT_NAME main_hook
+                          C_VISIBILITY_PRESET hidden)
+    target_link_options(rs_adrenotools_main_hook PRIVATE "LINKER:-z,global")
+    target_link_libraries(rs_adrenotools_main_hook PRIVATE rs_adrenotools_hook_impl)
+    foreach(lib rs_adrenotools rs_adrenotools_hook_impl rs_adrenotools_main_hook)
+        target_link_options(${lib} PRIVATE "LINKER:-z,max-page-size=16384")
+    endforeach()
+endif()
+
 # ---------------------------------------------------------------------------
 # The game
 # ---------------------------------------------------------------------------
@@ -180,6 +217,7 @@ set(REALSTEEL_SOURCES
     src/main.cpp
     src/realsteel_gamma_dump.cpp
     src/realsteel_gpu.cpp
+    src/realsteel_gpu_driver.cpp
     src/realsteel_mods.cpp
     src/realsteel_mods_pack.cpp
     src/realsteel_netplay.cpp
@@ -220,6 +258,7 @@ if(ANDROID)
     # The built-in GPU service replaces the emulation plugin.
     rexglue_setup_target(realsteel)
     target_link_libraries(realsteel PRIVATE android log)
+    add_dependencies(realsteel rs_adrenotools rs_adrenotools_main_hook)
 else()
     rexglue_setup_target(realsteel GPU_PLUGINS xenos)
 endif()
