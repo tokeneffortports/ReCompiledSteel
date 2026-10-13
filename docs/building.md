@@ -2,8 +2,8 @@
 
 Nothing from the game is in this repository. The build takes **your own copy
 of Real Steel** and produces the recompiled code and the shader cache from it
-on your machine. You need the game's Xbox Live Arcade package and, ideally,
-its title update (the 2015 one, the recompiled code is that version).
+on your machine. You need the game's Xbox Live Arcade package and its title
+update (the 2015 one: the recompiled code is that version, so it is required).
 
 Two things are generated and never checked in:
 
@@ -51,7 +51,7 @@ Buffalo, Xplorer360 or USBXTAFGUI; they are under
 | Folder on the console | What | Needed |
 | --- | --- | --- |
 | `000D0000\<40 hex characters>` (about 200 MB) | the game | yes |
-| `000B0000\<40 hex characters>` (about 6 MB) | the title update | yes, for building |
+| `000B0000\<40 hex characters>` (about 6 MB) | the title update | yes |
 | `00000002\<40 hex characters>` (18 files) | the add-ons | only to play them |
 
 Then lay them out in `work/`:

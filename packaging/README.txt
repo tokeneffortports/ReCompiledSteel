@@ -10,7 +10,7 @@ SETUP
 1. Copy your Real Steel files from the Xbox 360 to this PC. On the console
    they are under  Content\0000000000000000\584111E0\
        000D0000\...   the game (one file, about 200 MB)
-       000B0000\...   the title update (recommended)
+       000B0000\...   the title update (required)
        00000002\...   the add-on packs (optional)
    Get them off with FTP from a console running Aurora or FSD, or with a PC
    tool that reads Xbox 360 storage (Party Buffalo or Xplorer360 for a hard

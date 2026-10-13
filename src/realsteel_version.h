@@ -3,5 +3,5 @@
 #pragma once
 
 namespace realsteel {
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "0.1.1";
 }

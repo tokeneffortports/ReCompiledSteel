@@ -216,7 +216,14 @@ bool Run(const Plan& plan, const Log& log, const Progress& progress, std::string
                            Describe(plan.game));
   }
   stfs::Package update;
-  if (!plan.update.empty()) {
+  // The title update is required: the recompiled code is the updated game's,
+  // and the original default.xex alone does not start (2026-10-13).
+  if (plan.update.empty()) {
+    return Fail(error, "The title update package is missing. ReCompiled Steel needs it: the game is "
+                       "built for the updated version. On the console it is under "
+                       "Content/0000000000000000/584111E0/000B0000/.");
+  }
+  {
     if (!update.Open(plan.update, error)) return false;
     if (update.identity().title_id != kTitleId || update.Find("default.xexp") == nullptr) {
       return Fail(error, plan.update.filename().string() + " is not a Real Steel title update: " +
@@ -265,8 +272,6 @@ bool Run(const Plan& plan, const Log& log, const Progress& progress, std::string
     fs::copy_file(tu_dir / "default.xexp", game_dir / "default.xexp",
                   fs::copy_options::overwrite_existing, ec);
     if (ec) return Fail(error, "cannot copy default.xexp into " + game_dir.string());
-  } else {
-    log("No title update chosen: the game runs without the 2015 update's fixes.");
   }
 
   // Add-ons go where the game keeps saves, laid out the way its content

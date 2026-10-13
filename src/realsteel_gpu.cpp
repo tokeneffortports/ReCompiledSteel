@@ -210,9 +210,11 @@ class GpuService final : public rex::system::IGraphicsSystem {
                                    &GpuService::ReadThunk, &GpuService::WriteThunk);
 
     running_.store(true);
+    threads_left_.store(2);
     worker_ = rex::system::object_ref<XHostThread>(
         new XHostThread(kernel_state, 128 * 1024, 0, [this]() {
           WorkerMain();
+          threads_left_.fetch_sub(1);
           return 0;
         }));
     worker_->set_name("RS GPU Commands");
@@ -220,6 +222,7 @@ class GpuService final : public rex::system::IGraphicsSystem {
     vsync_ = rex::system::object_ref<XHostThread>(
         new XHostThread(kernel_state, 128 * 1024, 0, [this]() {
           VsyncMain();
+          threads_left_.fetch_sub(1);
           return 0;
         }));
     vsync_->set_name("RS GPU VSync");
@@ -256,7 +259,15 @@ class GpuService final : public rex::system::IGraphicsSystem {
   void Shutdown() override {
     if (!running_.exchange(false)) return;
     cv_.notify_all();
-    // The host threads end with the process; they hold no host resources.
+    // Wait (bounded) until both host threads have left their loops: the
+    // object is destroyed right after this, and a worker still waking up in
+    // cv_.wait_for would lock a destroyed mutex (2026-10-13: an Android start
+    // without the title update ended at once and aborted in exactly that).
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (threads_left_.load() > 0 && std::chrono::steady_clock::now() < give_up) {
+      cv_.notify_all();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
   }
 
  private:
@@ -685,6 +696,7 @@ class GpuService final : public rex::system::IGraphicsSystem {
   std::atomic<uint32_t> interrupts_begun_[2] = {};
   std::atomic<uint32_t> interrupts_done_[2] = {};
   std::atomic<bool> running_{false};
+  std::atomic<int> threads_left_{0};  // host threads still inside their loops
   std::atomic<uint32_t> counter_{0};
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;

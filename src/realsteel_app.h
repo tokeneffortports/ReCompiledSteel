@@ -21,6 +21,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -33,8 +34,10 @@
 #endif
 #include <windows.h>
 #endif
+#ifndef _WIN32
+#include <SDL3/SDL.h>  // message boxes (Linux, Android)
+#endif
 #ifdef __ANDROID__
-#include <SDL3/SDL.h>
 #include <unistd.h>
 #endif
 
@@ -192,25 +195,38 @@ class RealsteelApp : public rex::ReXApp {
         std::filesystem::is_directory(exe / "tu" / "pac", ec)) {
       paths.update_data_root = exe / "tu";
     }
-    if (paths.game_data_root.empty()) {
-      REXLOG_ERROR("No game data: run the setup program (it copies your own "
-                   "Real Steel files into game/ and tu/ beside the executable)");
+    // Nothing to play, or the game without its title update: the recompiled
+    // code is the updated game's, so the original default.xex alone starts at
+    // an address it does not have (2026-10-13, an Android report). Say what
+    // is missing and stop, rather than crash further in.
+    const bool no_game = paths.game_data_root.empty();
+    const bool no_update = !no_game &&
+        (!std::filesystem::is_regular_file(paths.game_data_root / "default.xexp", ec) ||
+         paths.update_data_root.empty());
+    if (no_game || no_update) {
+      const char* what = no_game
+          ? "The game files are not installed yet."
+          : "The Real Steel title update is missing. ReCompiled Steel needs it: the game "
+            "is built for the updated version.";
 #ifdef _WIN32
-      MessageBoxW(nullptr,
-                  L"The game files are not installed yet.\n\nRun RealSteelSetup.exe "
-                  L"in this folder first: it copies your own Real Steel files "
-                  L"from your Xbox 360 into the game folder.",
-                  L"ReCompiled Steel", MB_OK | MB_ICONINFORMATION);
+      const char* how = "Run RealSteelSetup.exe in this folder and point it at your Xbox 360 "
+                        "files: it installs the game, its title update and your add-ons.";
 #elif defined(__ANDROID__)
-      SDL_ShowSimpleMessageBox(
-          SDL_MESSAGEBOX_INFORMATION, "ReCompiled Steel",
-          "The game files were not found.\n\n"
-          "Copy your own Real Steel files into /sdcard/RealSteel/game and "
-          "/sdcard/RealSteel/tu (the same folders the PC setup program makes), "
-          "allow this app \"All files access\" in Android's settings, then "
-          "start it again.",
-          nullptr);
+      const char* how = "Press \"Install game files\" in the launcher and pick the folder with "
+                        "your Xbox 360 files: it installs the game, its title update and your add-ons.";
+#else
+      const char* how = "Run realsteel-setup in this folder and point it at your Xbox 360 "
+                        "files: it installs the game, its title update and your add-ons.";
 #endif
+      REXLOG_ERROR("{} {}", what, how);
+      const std::string text = std::string(what) + "\n\n" + how;
+#ifdef _WIN32
+      MessageBoxA(nullptr, text.c_str(), "ReCompiled Steel", MB_OK | MB_ICONINFORMATION);
+#else
+      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "ReCompiled Steel", text.c_str(), nullptr);
+#endif
+      rex::FlushLogging();
+      std::exit(1);
     }
     BackupSaves(paths.user_data_root);
     realsteel::mods::Install(paths);

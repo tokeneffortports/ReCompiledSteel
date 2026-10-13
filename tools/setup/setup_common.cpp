@@ -173,7 +173,7 @@ bool AskOnTerminal(Args* args) {
     args->game = game;
   }
   if (args->update.empty()) {
-    const std::string tu = Ask("The title update package (file, recommended; empty for none): ");
+    const std::string tu = Ask("The title update package (file, required): ");
     if (!tu.empty()) args->update = tu;
   }
   if (args->addons.empty()) {

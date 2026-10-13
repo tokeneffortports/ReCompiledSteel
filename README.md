@@ -29,7 +29,7 @@
 | Game | Real Steel, Xbox Live Arcade (Yuke's, 2011) |
 | Title ID | `584111E0` |
 | Game package | `000D0000` (Xbox Live Arcade) |
-| Title update | `000B0000`, recommended (the port is built from the updated game) |
+| Title update | `000B0000`, **required** (the port is built from the updated game) |
 | Add-ons | `00000002`, optional (all 18 packs are supported) |
 | `default.xex` | 4,825,088 bytes, CRC32 `E9E26E6B`, SHA-256 `D33B4336F93896A08FA8E4DA6257BEC2B81822332FE17D1227C11A87D038ABFB` |
 | `default.xexp` (title update) | 1,390,592 bytes, CRC32 `B62B468E`, SHA-256 `8780F37E994525009F44FB929CE1A8C34DA9C9B27D72E74D4DC11FAA662A3557` |
@@ -63,12 +63,17 @@ Mode**. It holds 60 fps. Saves are in `~/.local/share/realsteel`.
 
 ### Android
 
-Install **ReCompiledSteel-android-arm64-….apk**. Then copy your installed
-game files (the `game` and `tu` folders, and the add-ons from your PC's
-`Documents\realsteel`) into a `RealSteel` folder at the top of the device's
-storage. The layout is in [android/README.md](android/README.md). The first
-start asks for "All files access". A built-in controller works as-is, and
-touch controls appear when no controller is connected.
+1. Copy your Xbox 360 files (the game, its title update and any add-ons, for
+   example the whole `Content` folder from your console or USB stick) to the
+   device's storage or SD card.
+2. Install **ReCompiledSteel-android-arm64-….apk** and open it.
+3. Press **Allow file access**, then **Install game files**, and pick the
+   folder you copied. The installer finds the game, title update and add-ons
+   by itself and puts them in a `RealSteel` folder.
+4. Press **Start**.
+
+A built-in controller works as-is, and touch controls appear when no
+controller is connected. More in [android/README.md](android/README.md).
 
 ### Windows SmartScreen
 

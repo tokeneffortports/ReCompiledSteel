@@ -7,20 +7,22 @@ with Vulkan 1.3 should work but have not been tried.
 
 ## Installing
 
-1. Copy `ReCompiledSteel-android-arm64-<version>.apk` to the device and
+1. Copy your own Real Steel files from the Xbox 360 to the device's storage
+   or SD card: the game (`000D0000`), its title update (`000B0000`,
+   required) and any add-ons (`00000002`). The simplest is the whole
+   `Content/0000000000000000/584111E0` folder from the console or USB stick.
+2. Copy `ReCompiledSteel-android-arm64-<version>.apk` to the device and
    install it (allow installs from that file manager when Android asks).
-2. Copy your own game files into a folder called `RealSteel` at the top of
-   the device's internal storage, laid out like the PC version:
+3. Open ReCompiled Steel, press **Allow file access** (Android's "All files
+   access" setting: allow it and go back), then **Install game files**, and
+   pick the folder from step 1. The installer (the same code as the PC setup
+   programs) finds the packages, even in sub-folders, and lays them out in
+   `RealSteel/` at the top of the internal storage: `game/`, `tu/`, and the
+   add-ons under `user/`. Afterwards the copied packages can be deleted.
+4. Press **Start**.
 
-   | On the device | Copy from your PC install |
-   |---|---|
-   | `RealSteel/game/` | the `game` folder beside `realsteel.exe` |
-   | `RealSteel/tu/` | the `tu` folder beside `realsteel.exe` |
-   | `RealSteel/user/` | the contents of `Documents\realsteel` (add-ons in `0000000000000000`, and your saves if you want them) |
-   | `RealSteel/mods/` | optional: robot mods, as on the PC |
-
-3. Start ReCompiled Steel. The first time, Android opens the "All files
-   access" setting: allow it, go back, and start the game again.
+Robot mods go in `RealSteel/mods/`, as on the PC. Saves are in
+`RealSteel/user/`.
 
 Controls: any controller works, including a handheld's built-in one. With
 no controller connected, on-screen touch controls appear (Settings, Controls,

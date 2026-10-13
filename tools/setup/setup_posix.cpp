@@ -102,7 +102,7 @@ int RunWithDialogs(Tool tool, Args args) {
     args.scan.clear();
   }
   if (plan.update.empty() &&
-      Question(tool, "No title update found there. Do you have the title update package (recommended)?")) {
+      Question(tool, "No title update found there. It is required - pick the title update package?")) {
     const std::string tu = PickFile(tool, "The title update package", false, home);
     if (!tu.empty()) plan.update = tu;
   }

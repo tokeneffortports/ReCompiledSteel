@@ -297,7 +297,7 @@ int RunWindow(const Args& args) {
     y += 34;
   }
   Make(w, L"STATIC",
-       (L"Add-ons go to " + DefaultUserRoot().wstring() + L" (where the game keeps saves). The title update and add-ons are optional.")
+       (L"Add-ons go to " + DefaultUserRoot().wstring() + L" (where the game keeps saves). The game and its title update are required; add-ons are optional.")
            .c_str(),
        0, m, y, width - 2 * m, 34, 0);
   y += 40;

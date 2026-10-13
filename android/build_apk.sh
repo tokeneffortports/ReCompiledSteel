@@ -40,8 +40,9 @@ mkdir -p "$WORK/compiled" "$WORK/classes" "$WORK/dex" "$WORK/pkg/lib/arm64-v8a"
 
 echo "== Resources and manifest (aapt2) =="
 "$BT/aapt2" compile --dir "$SCRIPT_DIR/res" -o "$WORK/compiled/res.zip"
+mkdir -p "$WORK/gen"
 "$BT/aapt2" link -o "$WORK/base.apk" -I "$PLATFORM_JAR" \
-    --manifest "$SCRIPT_DIR/AndroidManifest.xml" \
+    --manifest "$SCRIPT_DIR/AndroidManifest.xml" --java "$WORK/gen" \
     --min-sdk-version 30 --target-sdk-version 35 \
     --version-code "$VERSION_CODE" --version-name "$VERSION" \
     "$WORK/compiled/res.zip"
@@ -64,6 +65,14 @@ echo "== Native libraries (stripped) =="
 cp "$LIBCXX" "$WORK/pkg/lib/arm64-v8a/"
 # The crash catcher, loaded before everything else (android/native/rscrash.c).
 "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --target=aarch64-linux-android30     -shared -fPIC -O2 -funwind-tables -Wl,-z,max-page-size=16384     -o "$WORK/pkg/lib/arm64-v8a/librscrash.so" "$SCRIPT_DIR/native/rscrash.c" -llog
+# The installer: the PC setup programs' code (tools/setup) behind a JNI bridge
+# (android/native/setup_jni.cpp), for the launcher's "Install game files".
+"$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --target=aarch64-linux-android30 \
+    -std=c++20 -shared -fPIC -O2 -static-libstdc++ -Wl,-z,max-page-size=16384 \
+    -ffile-prefix-map="$SRC"=. -ffile-prefix-map="$HOME"=~ \
+    -o "$WORK/pkg/lib/arm64-v8a/librssetup.so" \
+    "$SRC/tools/setup/stfs.cpp" "$SRC/tools/setup/install.cpp" "$SCRIPT_DIR/native/setup_jni.cpp" -llog
+"$STRIP" --strip-debug "$WORK/pkg/lib/arm64-v8a/librssetup.so"
 cp "$WORK/dex/classes.dex" "$WORK/pkg/"
 # Our licence and the third-party notices the libraries need, as on the PC.
 mkdir -p "$WORK/pkg/assets/licenses"
