@@ -15,14 +15,17 @@ ReCompiledSteel\
 
 1. Unzip the robot into the game's `mods` folder, so that the robot's folder
    is directly inside `mods` (`mods\MyRobot\robot.txt` must exist).
-2. Start the game. The first start after a change takes a second or two
-   longer while the robot is installed.
+2. Start the game. The first start after a change takes a few seconds
+   longer while the game builds and installs the robot.
 3. **Assembly Mode → your robot → Customize**: the new parts are in each list
    (Head, Body, Arms, Fists, Legs), named after the robot. Buy them in the
    shop if they are not yours yet, equip them and save.
 
 - The official add-ons must be installed (mods are added on top of the newest
-  add-on pack). The game says so in its log if they are missing.
+  add-on pack). A robot that cannot be loaded - no add-ons, a base set
+  (`based_on`) the game does not know or whose add-on files are missing, a
+  model with a problem - is left out, and the game says which and why in a
+  message at the bottom of the screen after it starts (and in its log).
 - To remove a robot, delete its folder. A saved robot still wearing its parts
   shows plain white stand-in parts until you equip something else. When no
   saved robot uses a removed mod any more, the game forgets it.
@@ -43,16 +46,19 @@ python tools/mods/make_mod.py --new mods/MyRobot --name "MY ROBOT" --based-on KO
 
 This starts a robot: a `robot.txt` and a simple blocky robot fitted to the
 chosen skeleton (seven OBJ models with PNG textures). Reshape and repaint it
-in any 3D tool and paint program, then build it:
+in any 3D tool and paint program, then check it:
 
 ```bash
 python tools/mods/make_mod.py mods/MyRobot
 ```
 
-The build checks every rule below, tells you exactly what is wrong, and writes
-`mods/MyRobot/built/`, the files the game loads. Copy the folder into the
-game's `mods` folder and start the game. To share it, zip the folder
-**including `built`**. Players don't need Python.
+The check goes through every rule below and tells you exactly what is wrong.
+There is nothing to build: copy the folder into the game's `mods` folder and
+start the game, which makes the models into game files itself, from the
+player's own copy of the base set. To share a robot, zip its folder as it is.
+It holds only your own files, no data from the game, and players don't need
+Python. (Older robots came with a `built` folder; the game still loads those,
+but a folder with its models uses them and ignores `built`.)
 
 `make_mod.py` reads the base set from the game folder and the add-ons from your
 user data folder (`Documents\realsteel` on Windows,
@@ -70,7 +76,6 @@ MyRobot\
   <part>_glow.png           glow mask (white glows), optional
   <part>_normal.png, _gloss.png, _ao.png    optional
   skeleton_scale.txt        one number, the robot's size, optional
-  built\                    written by the build
 ```
 
 **Coordinates.** Each part has its own space. Reshape a part in place; don't
@@ -201,7 +206,8 @@ keeps it, and the game logs the clash.
 
 | ID | Robot | Based on | Where to get it |
 | --- | --- | --- | --- |
-| | *none claimed yet* | | |
+| 606 | ANGLER | BOULDER | the ReCompiled Steel mods download (release page) |
+| 773 | QUILLBACK | KOGA | the ReCompiled Steel mods download (release page) |
 
 ### Limits
 

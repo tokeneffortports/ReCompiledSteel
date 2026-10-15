@@ -69,6 +69,15 @@ bool ShaderLibrary::PrintTemplateKey(const std::string& path) {
   return true;
 }
 
+// The highest SPIR-V version among the shaders decoded so far, logged when
+// it rises (a Vulkan 1.1 device accepts up to SPIR-V 1.3).
+static void NoteSpirvVersion(const std::vector<uint32_t>& spirv) {
+  static uint32_t highest = 0;
+  if (spirv.size() < 2 || spirv[1] <= highest) return;
+  highest = spirv[1];
+  std::printf("[vk] shaders use SPIR-V %u.%u\n", (highest >> 16) & 0xff, (highest >> 8) & 0xff);
+}
+
 bool ShaderLibrary::DecodeEntry(size_t entry_index, ShaderInfo& info,
                                 const char** why) {
   const ShaderCacheEntry& entry = g_shaderCacheEntries[entry_index];
@@ -88,6 +97,7 @@ bool ShaderLibrary::DecodeEntry(size_t entry_index, ShaderInfo& info,
     *why = "smol-v decode failed";
     return false;
   }
+  NoteSpirvVersion(info.spirv);
   return true;
 }
 
@@ -466,6 +476,7 @@ const ShaderInfo* ShaderLibrary::Resolve(uint32_t va, uint32_t stride_bytes,
   if (!smolv::Decode(smol, entry.spirvSize, info.spirv.data(), spirv_bytes)) {
     return report_missing("smol-v decode failed");
   }
+  NoteSpirvVersion(info.spirv);
 
   for (size_t i = 0; i < g_shaderVertexFetchCount; ++i) {
     if (g_shaderVertexFetches[i].hash == cache_hash &&

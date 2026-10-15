@@ -18,12 +18,13 @@ struct Push {
   float4 xform;  // scale.xy, offset.zw: window coordinates -> clip space
   uint mode;     // 0 SDR, 1 HDR10 (PQ), 2 scRGB
   float paper;   // HDR: nits for UI white
-  float2 unused;
+  float2 rot;    // Android pre-rotation: cos, sin of the quarter turn (1, 0 = none)
 };
 [[vk::push_constant]] Push pc;
 VSOut vs_main(VSIn i) {
   VSOut o;
-  o.pos = float4(i.pos * pc.xform.xy + pc.xform.zw, 0.0, 1.0);
+  const float2 p = i.pos * pc.xform.xy + pc.xform.zw;
+  o.pos = float4(pc.rot.x * p.x - pc.rot.y * p.y, pc.rot.y * p.x + pc.rot.x * p.y, 0.0, 1.0);
   o.uv = i.uv;
   o.color = i.color;
   return o;

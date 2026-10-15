@@ -248,6 +248,23 @@ uint64_t DumpTexture(uint8_t* base, const uint32_t fetch[6], uint32_t phys,
 
 }  // namespace
 
+namespace {
+// 2026-10-15: most of a draw's ~20 texture slots are what the previous draw
+// bound. Each slot remembers its fetch words and results for the frame, so an
+// unchanged slot costs six loads and a compare instead of two locked map
+// lookups (0.8 ms of draw hooks a frame on a PC, several times that on a
+// phone). The draw hooks run on the one guest render thread.
+struct SlotMemo {
+  uint64_t frame = ~0ull;
+  bool armed = false;
+  bool has_hash_out = false;
+  uint32_t fetch[6] = {};
+  uint32_t id = 0, fmt = 0;
+  uint64_t hash = 0;
+};
+thread_local SlotMemo t_slot_memo[kSlotCount];
+}  // namespace
+
 void CaptureBoundTextures(uint8_t* base, uint32_t device,
                           uint32_t out_ids[kSlotCount],
                           uint32_t out_fmt[kSlotCount],
@@ -267,6 +284,23 @@ void CaptureBoundTextures(uint8_t* base, uint32_t device,
     for (uint32_t i = 0; i < 6; ++i) {
       fetch[i] = REX_LOAD_U32(addr + i * 4);
     }
+    SlotMemo& memo = t_slot_memo[s];
+    const bool want_hash = out_hash != nullptr;
+    if (!dump && memo.frame == frame && memo.armed == armed &&
+        memo.has_hash_out == want_hash &&
+        std::memcmp(memo.fetch, fetch, sizeof(fetch)) == 0) {
+      out_ids[s] = memo.id;
+      out_fmt[s] = memo.fmt;
+      if (want_hash) out_hash[s] = memo.hash;
+      continue;
+    }
+    memo.frame = frame;
+    memo.armed = armed;
+    memo.has_hash_out = want_hash;
+    std::memcpy(memo.fetch, fetch, sizeof(fetch));
+    memo.id = 0;
+    memo.fmt = 0;
+    memo.hash = 0;
     // FetchConstantType: 2 = texture, 0 = "invalid texture". Real Steel
     // binds its render-target textures (blur/bloom targets, 2026-09-05
     // capture: dw0=0x8a004800 dw1=0x112bd086) and some DXT1 textures with
@@ -294,6 +328,8 @@ void CaptureBoundTextures(uint8_t* base, uint32_t device,
     out_ids[s] = phys;
     out_fmt[s] = (fetch[1] & 0x3Fu) | (((fetch[5] >> 9) & 0x3u) << 8) |
                  (((fetch[1] >> 6) & 0x3u) << 12);
+    memo.id = out_ids[s];
+    memo.fmt = out_fmt[s];
     if (dump) {
       const uint64_t h = DumpTexture(base, fetch, phys, disk_armed, frame);
       if (out_hash != nullptr && disk_armed) out_hash[s] = h;
@@ -310,6 +346,7 @@ void CaptureBoundTextures(uint8_t* base, uint32_t device,
       }
       out_hash[s] = fh.hash;
     }
+    if (want_hash) memo.hash = out_hash[s];
   }
 }
 

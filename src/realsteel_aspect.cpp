@@ -3,8 +3,8 @@
 //
 // The renderer shows more than the game's 16:9 view (taller at 4:3, wider at
 // 21:9, see vk_backend.cpp), but the game still culled to its own 16:9
-// frustum: things in the extra strips popped in and out (the author's Nova,
-// 4:3). sub_82104688 builds the view frustum for culling (this r3, fov f1 -
+// frustum: things in the extra strips popped in and out (seen on a
+// 4:3 screen). sub_82104688 builds the view frustum for culling (this r3, fov f1 -
 // vertical, its half used as an angle; near f2, far f3; horizontal half =
 // fov / 2 * 16/9, picked from the video mode as the projection does in
 // sub_821B03E8). Its fov is widened so the frustum covers the whole picture;

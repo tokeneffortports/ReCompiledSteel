@@ -220,6 +220,7 @@ set(REALSTEEL_SOURCES
     src/realsteel_gpu_driver.cpp
     src/realsteel_mods.cpp
     src/realsteel_mods_pack.cpp
+    src/realsteel_mods_build.cpp
     src/realsteel_netplay.cpp
     src/realsteel_online.cpp
     src/realsteel_overlay.cpp

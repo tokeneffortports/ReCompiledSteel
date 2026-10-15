@@ -15,12 +15,6 @@ struct VSOut {
   float4 pos : SV_Position;
   float2 uv : TEXCOORD0;
 };
-VSOut vs_main(uint id : SV_VertexID) {
-  VSOut o;
-  o.uv = float2((id << 1) & 2, id & 2);
-  o.pos = float4(o.uv * 2.0 - 1.0, 0.0, 1.0);
-  return o;
-}
 Texture2D src : register(t0);
 SamplerState smp : register(s1);
 struct Push {
@@ -31,8 +25,20 @@ struct Push {
   float paper;     // HDR: nits for SDR white
   float peak;      // HDR: nits for the brightest highlight
   uint fxaa;       // 1 = on
+  // 2026-10-15: Android pre-rotation (vertex stage, offset 32) - the picture
+  // is drawn already turned to the panel's own orientation: cos, sin of the
+  // quarter turn (1, 0 = none), so the compositor need not turn every frame.
+  float2 rot;
 };
 [[vk::push_constant]] Push pc;
+
+VSOut vs_main(uint id : SV_VertexID) {
+  VSOut o;
+  o.uv = float2((id << 1) & 2, id & 2);
+  const float2 p = o.uv * 2.0 - 1.0;
+  o.pos = float4(pc.rot.x * p.x - pc.rot.y * p.y, pc.rot.y * p.x + pc.rot.x * p.y, 0.0, 1.0);
+  return o;
+}
 
 float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 

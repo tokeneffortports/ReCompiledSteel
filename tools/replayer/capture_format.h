@@ -14,9 +14,15 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace rs::capture {
 
@@ -161,6 +167,50 @@ bool LoadFrameFromMemory(const uint8_t* bytes, size_t size,
 inline uint32_t LoadBE32(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
          (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+
+// Big-endian 32-bit (16-bit) words to little-endian, bytes/4 (bytes/2) of
+// them (2026-10-15: the renderer converts several MB a frame - vertex data,
+// constant banks, indices - and the byte-at-a-time loop was not vectorised on
+// arm64). Any alignment; a trailing partial word is left alone.
+inline void CopySwap32(uint8_t* dst, const uint8_t* src, size_t bytes) {
+  size_t i = 0;
+#if defined(__aarch64__)
+  for (; i + 64 <= bytes; i += 64) {
+    uint8x16x4_t v = vld1q_u8_x4(src + i);
+    v.val[0] = vrev32q_u8(v.val[0]);
+    v.val[1] = vrev32q_u8(v.val[1]);
+    v.val[2] = vrev32q_u8(v.val[2]);
+    v.val[3] = vrev32q_u8(v.val[3]);
+    vst1q_u8_x4(dst + i, v);
+  }
+#endif
+  for (; i + 4 <= bytes; i += 4) {
+    uint32_t v;
+    std::memcpy(&v, src + i, 4);
+    v = __builtin_bswap32(v);
+    std::memcpy(dst + i, &v, 4);
+  }
+}
+
+inline void CopySwap16(uint8_t* dst, const uint8_t* src, size_t bytes) {
+  size_t i = 0;
+#if defined(__aarch64__)
+  for (; i + 64 <= bytes; i += 64) {
+    uint8x16x4_t v = vld1q_u8_x4(src + i);
+    v.val[0] = vrev16q_u8(v.val[0]);
+    v.val[1] = vrev16q_u8(v.val[1]);
+    v.val[2] = vrev16q_u8(v.val[2]);
+    v.val[3] = vrev16q_u8(v.val[3]);
+    vst1q_u8_x4(dst + i, v);
+  }
+#endif
+  for (; i + 2 <= bytes; i += 2) {
+    uint16_t v;
+    std::memcpy(&v, src + i, 2);
+    v = __builtin_bswap16(v);
+    std::memcpy(dst + i, &v, 2);
+  }
 }
 
 // Name for a Yuke's render-command type where known (docs/d3d_surface.md),

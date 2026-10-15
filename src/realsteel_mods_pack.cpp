@@ -8,17 +8,20 @@
 
 #include "realsteel_mods_pack.h"
 
+#include "realsteel_mods_build.h"
 #include "realsteel_netplay.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -59,6 +62,17 @@ const char* const kSlots[] = {"BODY", "LEG", "HEAD", "L_ARM", "R_ARM", "L_GLOVE"
 struct Failure : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
+
+// What the player is told about robots that were not loaded (shown on screen
+// after start-up by the overlay, and logged).
+std::mutex g_notice_mutex;
+std::vector<std::string> g_notices;
+
+void Notice(const std::string& text) {
+  REXLOG_WARN("[mods] {}", text);
+  std::lock_guard<std::mutex> lock(g_notice_mutex);
+  g_notices.push_back(text);
+}
 
 // --- little helpers --------------------------------------------------------
 
@@ -673,12 +687,45 @@ void rename_menu_strings(Archive& text) {
 
 struct Robot {
   std::string name;
-  fs::path models;  // built/ folder
+  fs::path models;  // built/ folder, or the robot folder itself when built from source; empty: placeholder
   int index = 0;    // stable slot from the registry (ids = stock max + 1 + index)
   std::string base = "BASENJA";   // the stock set whose skeleton and stats it takes
   StatOverrides stats;            // fields of the copied stats records to change
   int wanted_index = -1;          // robot.txt "id = N": the index to use (0..959)
+  bool from_source = false;       // models are made here from the folder's OBJ / PNG files
+  std::string sig;                // this robot's part of the install signature
 };
+
+// The archives a base set's models come from: the base game's, or the
+// official add-on content's (by part group).
+const char* const kStockPrefix[] = {"ed", "DLC01_ed", "DLC03_ed", "DLC04_ed"};
+
+fs::path stock_archive_path(int group, int n, const fs::path& game, const fs::path& src) {
+  char f[32];
+  std::snprintf(f, sizeof(f), "%s%02d.pac", kStockPrefix[group], n);
+  return (group == 0 ? game / "pac" / "edit" : src / "pac" / "edit") / f;
+}
+
+// The newest official add-on package (the mod package is built on top of it).
+fs::path source_package(const fs::path& root) {
+  const fs::path packages = root / "0000000000000000" / kTitle / "00000002";
+  fs::path src;
+  std::error_code ec;
+  if (fs::is_directory(packages, ec))
+    for (auto& e : fs::directory_iterator(packages, ec))
+      if (e.is_directory() && e.path().filename().string().rfind(kSourcePrefix, 0) == 0) src = e.path();
+  return src;
+}
+
+// REALSTEEL_MODS_DUMP=<folder>: part files made from source are also written
+// there (<robot>/ed<slot>_<kind>_<item>.bin), to compare with robot_folder.py.
+void dump_built(const std::string& robot, int slot, char kind, const std::string& item, const Bytes& data) {
+  const char* dir = std::getenv("REALSTEEL_MODS_DUMP");
+  if (dir == nullptr || *dir == 0) return;
+  char f[48];
+  std::snprintf(f, sizeof(f), "ed%02d_%c_%s.bin", slot, kind, item.c_str());
+  write_file(fs::path(dir) / robot / f, data);
+}
 
 void copy_or_link(const fs::path& from, const fs::path& to) {
   fs::create_directories(to.parent_path());
@@ -697,10 +744,7 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
                    const std::vector<Robot>& robots, const std::string& signature) {
   const fs::path base = root / "0000000000000000" / kTitle;
   const fs::path packages = base / "00000002";
-  fs::path src;
-  if (fs::is_directory(packages))
-    for (auto& e : fs::directory_iterator(packages))
-      if (e.is_directory() && e.path().filename().string().rfind(kSourcePrefix, 0) == 0) src = e.path();
+  const fs::path src = source_package(root);
   if (src.empty() && !robots.empty())
     throw Failure("the official DLC is not installed (package " + std::string(kSourcePrefix) + "... missing in " + packages.string() + ")");
   const fs::path out = packages / kPackageName;
@@ -737,10 +781,7 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
     // the stock archives the base sets' models come from, loaded when needed
     std::map<std::string, std::unique_ptr<Archive>> stock;
     auto stock_archive = [&](int group, int n) -> Archive* {
-      const char* prefix[] = {"ed", "DLC01_ed", "DLC03_ed", "DLC04_ed"};
-      char f[32];
-      std::snprintf(f, sizeof(f), "%s%02d.pac", prefix[group], n);
-      const fs::path path = (group == 0 ? game / "pac" / "edit" : src / "pac" / "edit") / f;
+      const fs::path path = stock_archive_path(group, n, game, src);
       if (group == 3) return eds[n].get();
       if (!stock.count(path.string())) stock[path.string()] = std::make_unique<Archive>(path);
       return stock[path.string()].get();
@@ -775,7 +816,15 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
       }
 
       // models and textures: a copy of the base set's entries (from its own
-      // archives) with the robot's files dropped in (ed<slot>_<kind>_<item>.bin)
+      // archives) with the robot's files dropped in - made here from its OBJ /
+      // PNG sources, each from the base set's entry it replaces, or (older
+      // mods) read from its built/ folder (ed<slot>_<kind>_<item>.bin)
+      std::unique_ptr<RobotSource> source;
+      if (robot.from_source && !robot.models.empty()) {
+        source = std::make_unique<RobotSource>(robot.models);
+        const std::vector<std::string> problems = source->Check();
+        if (!problems.empty()) throw Failure(robot.name + ": " + problems.front());
+      }
       for (int n = 1; n <= 7; ++n) {
         char gname[8];
         std::snprintf(gname, sizeof(gname), "ED%02d", n);
@@ -791,6 +840,15 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
           auto copy_node = std::make_unique<Node>(new_name, original->raw);
           for (auto& child : copy_node->children) {
             if (robot.models.empty()) break;             // placeholder: the stock models stay
+            if (source) {
+              const uint32_t item = uint32_t(std::strtoul(child->name.c_str(), nullptr, 16));
+              std::optional<Bytes> made = source->Build(n, kind, item, child->data);
+              if (made) {
+                dump_built(robot.name, n, kind, child->name, *made);
+                child->set_data(std::move(*made));
+              }
+              continue;
+            }
             char f[48], legacy[48];
             std::snprintf(f, sizeof(f), "ed%02d_%c_%s.bin", n, kind, child->name.c_str());
             std::snprintf(legacy, sizeof(legacy), "ed%02d_%cBBF_%s.bin", n, kind, child->name.c_str());
@@ -1092,27 +1150,41 @@ std::vector<Robot> scan(const fs::path& mods, std::string& signature) {
     int wanted_index = -1;
     const std::string name = read_name(robot_txt, &base, &stats, &wanted_index);
     if (base.empty()) base = "BASENJA";
+    // The robot's own files (OBJ / PNG, made into game files at install time),
+    // or the built/ folder older mods came with.
     const fs::path built = folder / "built";
-    if (name.empty() || !(fs::is_regular_file(built / "ed07_M_07D7.bin") || fs::is_regular_file(built / "ed07_MBBF_07D7.bin"))) {
-      REXLOG_WARN("[mods] {}: needs a name in robot.txt and a built/ folder (see FORMAT.md), skipped",
-                  folder.filename().string());
+    const bool from_source = RobotSource::HasSource(folder);
+    const bool has_built = fs::is_regular_file(built / "ed07_M_07D7.bin") || fs::is_regular_file(built / "ed07_MBBF_07D7.bin");
+    if (name.empty()) {
+      Notice(folder.filename().string() + " not loaded: its robot.txt needs a name (name = ...)");
       continue;
     }
-    signature += name + " based on " + base + "\n";
+    if (!from_source && !has_built) {
+      Notice(name + " not loaded: its folder has no models (body.obj and the other parts)");
+      continue;
+    }
+    std::string sig = name + " based on " + base + (from_source ? " from source" : "") + "\n";
     for (const auto& [slot, fields] : stats)
       for (const auto& [field, value] : fields)
-        signature += "  stat " + std::to_string(slot) + ":" + std::to_string(field) + "=" + std::to_string(value) + "\n";
+        sig += "  stat " + std::to_string(slot) + ":" + std::to_string(field) + "=" + std::to_string(value) + "\n";
     std::vector<fs::path> files;
-    for (auto& e : fs::directory_iterator(built))
-      if (e.is_regular_file()) files.push_back(e.path());
+    if (from_source) {
+      files = RobotSource::SourceFiles(folder);
+    } else {
+      for (auto& e : fs::directory_iterator(built))
+        if (e.is_regular_file()) files.push_back(e.path());
+    }
     std::sort(files.begin(), files.end());
     for (const fs::path& f : files) {
       // (libc++ on Android keeps file times as __int128: narrow for to_string)
       const auto t = static_cast<long long>(fs::last_write_time(f).time_since_epoch().count());
-      signature += f.filename().string() + " " + std::to_string(fs::file_size(f)) + " " + std::to_string(t) + "\n";
+      sig += f.filename().string() + " " + std::to_string(fs::file_size(f)) + " " + std::to_string(t) + "\n";
     }
-    Robot robot{name, built, 0, base, stats};
+    signature += sig;
+    Robot robot{name, from_source ? folder : built, 0, base, stats};
     robot.wanted_index = wanted_index;
+    robot.from_source = from_source;
+    robot.sig = sig;
     robots.push_back(std::move(robot));
   }
   return robots;
@@ -1248,7 +1320,7 @@ std::vector<std::string> read_saves(const fs::path& root) {
 // robot wears): the set table - the long chain of ten-record set entries
 // (8-byte records, entries 80 bytes apart; garage robots form at most a
 // short chain) - and the owned-parts list (4-byte records "slot, id",
-// hundreds back to back). Found in the author's profile, 2026-10-12.
+// hundreds back to back). Found in a test profile, 2026-10-12.
 std::vector<std::pair<size_t, size_t>> ownership_ranges(const std::string& d) {
   auto u16 = [&](size_t at) { return uint32_t(uint8_t(d[at])) << 8 | uint8_t(d[at + 1]); };
   std::vector<std::pair<size_t, size_t>> ranges;
@@ -1302,7 +1374,85 @@ std::string read_text(const fs::path& p) {
   return f ? std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()) : std::string();
 }
 
+// Keeps out the robots that cannot be installed, telling the player why: an
+// unknown base set, a base set whose add-on files are missing, models with
+// problems. Results are remembered per robot (mods_checks.txt in the user
+// data folder) until its files, the add-ons or the update change, so a
+// normal start does not read every model again.
+void check_robots(std::vector<Robot>& robots, const fs::path& root, const fs::path& game, const fs::path& update_in,
+                  const fs::path& src) {
+  const fs::path checks_file = root / "mods_checks.txt";
+  std::map<std::string, std::string> cached;
+  {
+    std::ifstream in(checks_file);
+    std::string line;
+    while (std::getline(in, line)) {
+      const size_t space = line.find(' ');
+      if (space != std::string::npos) cached[line.substr(0, space)] = line.substr(space + 1);
+    }
+  }
+  std::string stamp = src.filename().string();
+  for (const fs::path& p : {update_in / "pac" / "misc.pac", update_in / "pac" / "string.pac"}) {
+    std::error_code ec;
+    stamp += " " + std::to_string(static_cast<long long>(fs::last_write_time(p, ec).time_since_epoch().count()));
+  }
+  std::unique_ptr<Archive> tu, text;
+  std::map<std::string, std::string> results;
+  std::vector<Robot> kept;
+  for (Robot& robot : robots) {
+    uint64_t hash = 1469598103934665603ull;
+    for (char c : robot.sig + stamp + " checks 1") hash = (hash ^ uint8_t(c)) * 1099511628211ull;
+    char key[24];
+    std::snprintf(key, sizeof(key), "%016llx", static_cast<unsigned long long>(hash));
+    std::string result;
+    const auto found = cached.find(key);
+    if (found != cached.end()) {
+      result = found->second;
+    } else {
+      try {
+        if (!tu) {
+          tu = std::make_unique<Archive>(update_in / "pac" / "misc.pac");
+          text = std::make_unique<Archive>(update_in / "pac" / "string.pac");
+        }
+        const Base base = resolve_base(robot.base, *tu, *text);
+        for (int n = 1; n <= 7; ++n) {
+          if (!fs::is_regular_file(stock_archive_path(base.group, n, game, src)))
+            throw Failure("its base set " + robot.base + " needs add-on content (DLC) that is not installed");
+        }
+        if (robot.from_source) {
+          RobotSource source(robot.models);
+          const std::vector<std::string> problems = source.Check();
+          if (!problems.empty()) {
+            result = problems.front();
+            if (problems.size() > 1) result += " (and " + std::to_string(problems.size() - 1) + " more problems, see the log)";
+            for (const std::string& p : problems) REXLOG_WARN("[mods] {}: {}", robot.name, p);
+          }
+        }
+        if (result.empty()) result = "ok";
+      } catch (const std::exception& e) {
+        result = e.what();
+      }
+    }
+    for (char& c : result)
+      if (c == '\n' || c == '\r') c = ' ';
+    results[key] = result;
+    if (result == "ok") {
+      kept.push_back(std::move(robot));
+    } else {
+      Notice(robot.name + " not loaded: " + result);
+    }
+  }
+  robots = std::move(kept);
+  std::ofstream out(checks_file, std::ios::binary);
+  for (const auto& [key, result] : results) out << key << ' ' << result << '\n';
+}
+
 }  // namespace
+
+std::vector<std::string> Notices() {
+  std::lock_guard<std::mutex> lock(g_notice_mutex);
+  return g_notices;
+}
 
 void InstallOnce(rex::PathConfig& paths);
 
@@ -1324,9 +1474,26 @@ void InstallOnce(rex::PathConfig& paths) {
   try {
     const std::string dir = REXCVAR_GET(realsteel_mods_dir);
     const fs::path mods = dir.empty() ? exe_dir() / "mods" : fs::path(dir);
-    std::string signature = "loader 9 ";   // bump when the package layout changes
+    std::string signature = "loader 10 ";   // bump when the package layout changes
+    {
+      std::lock_guard<std::mutex> lock(g_notice_mutex);
+      g_notices.clear();
+    }
     std::vector<Robot> robots = scan(mods, signature);
     const fs::path root = paths.user_data_root;
+    if (!robots.empty()) {
+      // The mod package is made from the newest official add-on package: no
+      // add-ons, no mods (said once for all of them).
+      const fs::path src = source_package(root);
+      if (src.empty()) {
+        std::string names;
+        for (const Robot& r : robots) names += (names.empty() ? "" : ", ") + r.name;
+        Notice("Mods not loaded (" + names + "): they need the official add-on content (DLC), which is not installed");
+        return;
+      }
+      if (!paths.update_data_root.empty() && fs::is_regular_file(paths.update_data_root / "pac" / "misc.pac"))
+        check_robots(robots, root, paths.game_data_root, paths.update_data_root, src);
+    }
     const fs::path update_out = root / "update_mods";
     // A robot that was installed once stays in the registry: when its folder
     // is gone it is built as a placeholder (same ids and names, the stock

@@ -1,8 +1,15 @@
-"""Turns a robot folder (OBJ models + PNG textures, see FORMAT.md) into the
-game-format files the game loads: writes <robot folder>/built/.
+"""Checks a robot folder (OBJ models + PNG textures, see docs/modding.md):
+the game itself makes the folder's models into game files when it starts,
+from the player's own copy of the base set, so a robot is shared as the
+folder - nothing to build, no game data inside.
 
-  make_mod.py <robot folder> [--root <user data folder>] [--game <game folder>]
+  make_mod.py <robot folder> [--root <user data folder>] [--game <game folder>] [--built]
   make_mod.py --new <robot folder> [--name NAME] [--based-on SET] [--root ...] [--game ...]
+
+--built also writes the game files to <robot folder>/built/ the way the
+game makes them (for testing the game's builder against this reference;
+the game ignores built/ when the folder has its models, and built/ holds
+data from the game, so never share it).
 
 --new starts a robot: a folder with a robot.txt and a simple blocky robot
 (seven OBJ models, PNG textures) fitted to the chosen set's skeleton, ready
@@ -68,6 +75,7 @@ def main():
     game = os.path.normpath(os.path.join(HERE, '..', '..'))
     folder = None
     new = False
+    write_built = False
     name, based_on = None, 'BASENJA'
     while args:
         a = args.pop(0)
@@ -77,6 +85,8 @@ def main():
             game = args.pop(0)
         elif a == '--new':
             new = True
+        elif a == '--built':
+            write_built = True
         elif a == '--name' and args:
             name = args.pop(0)
         elif a == '--based-on' and args:
@@ -114,8 +124,11 @@ def main():
     built = os.path.join(folder, 'built')
     if os.path.isdir(built):
         shutil.rmtree(built)
-    robot_folder.build(templates, folder, built)
-    print('done: %s is ready - copy the folder into the game\'s mods folder and start the game' % folder)
+    if write_built:
+        robot_folder.build(templates, folder, built)
+        print('wrote %s (for testing only - never share it, it holds data from the game)' % built)
+    print('done: %s is ready - copy the folder into the game\'s mods folder; the game builds the robot when it starts'
+          % folder)
 
 
 if __name__ == '__main__':

@@ -27,9 +27,19 @@ void Tick(float width, float height, bool page_open);
 void Draw(ImDrawList* draw_list, ImFont* font, float width, float height);
 // The controls are on screen.
 bool Visible();
+// The device has a touch screen (pages widen their scrollbars).
+bool HasTouch();
 // The settings button was tapped since the last call.
 bool TakeSettingsTap();
 // Guest thread: adds the touched buttons and stick to a pad state.
 void Merge(keyboard::PadState* state);
+// Arrange mode (Settings > Controls > Arrange touch controls): the controls
+// show with outlines, fingers drag them in groups, DONE saves the layout to
+// realsteel_touch_layout, RESET restores the original. UI thread.
+void BeginArrange();
+bool Arranging();
+// The arrange mode saved a layout since the last call (the settings file
+// should be written).
+bool TakeLayoutSaved();
 
 }  // namespace realsteel::touch

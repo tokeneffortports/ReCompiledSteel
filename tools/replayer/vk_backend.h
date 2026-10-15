@@ -40,7 +40,7 @@ struct RenderOptions {
   // 2026-09-06: the xenos plugin's presenter applies the title's display
   // gamma ramp (game builds sRGB / Rec.709 / pow(1/level) from
   // VdGetCurrentDisplayGamma, composed with the brightness LUT); measured
-  // against the author's screenshot the net curve is ~pow(1.28). Not applied by
+  // against a reference screenshot the net curve is ~pow(1.28). Not applied by
   // default; --vkgamma 1.28 matches the screenshots.
   float output_gamma = 1.0f;
   bool no_gamma_ramp = false;      // --vknoramp: ignore a captured (v14) display ramp
@@ -51,6 +51,15 @@ struct RenderOptions {
   // fetch evidently lands in focus), so matching xenos means switching it
   // off. Which one the console showed is not established.
   bool no_dof = false;
+  // Low-end settings (2026-10-15, both off by default = the game as made):
+  // leave out the audience in the stands, and halve textures of 256 px and
+  // up as they are loaded (less memory and bandwidth, softer surfaces).
+  bool no_crowd = false;
+  // Android: draw the picture turned to the panel's own orientation when the
+  // display is turned from it (pre-rotation) instead of letting the
+  // compositor turn every frame.
+  bool prerotate = true;
+  bool half_textures = false;
   // --vktemplates: resolve vertex shaders through the on-disk templates even
   // when the exact runtime-patched translation exists (equivalence testing).
   bool prefer_vs_templates = false;
@@ -256,6 +265,12 @@ class Renderer {
   // Render): the game's multisampling on/off, anisotropic filtering level
   // (1 = off) and present sharpening (0-1).
   void SetQuality(bool msaa, uint32_t anisotropy, float sharpen);
+  // Low-end settings (RenderOptions::no_crowd / half_textures); changing the
+  // texture setting reloads the textures at the next frame.
+  void SetLowEnd(bool crowd, bool half_textures);
+  // Android pre-rotation on/off (RenderOptions::prerotate); rebuilds the
+  // swapchain at the next frame.
+  void SetPrerotate(bool on);
   // FXAA and HDR (same thread as Render). Turning HDR on or off rebuilds the
   // swapchain at the next frame; HdrActive says what the display took.
   // Readbacks (screenshots, recordings) at the internal resolution with the
@@ -294,6 +309,13 @@ class Renderer {
 void SetVulkanLoader(void* get_instance_proc_addr);
 // "<GPU>, driver <name> [<info>] (id, version, Vulkan x.y.z)" once Init ran.
 const std::string& DriverDescription();
+// After a failed Init: a player-facing reason when the GPU or its driver
+// lacks what the renderer needs (empty for other failures).
+const std::string& InitError();
+// GPU memory in use and available, summed over the device-local heaps, as
+// the driver reports them (VK_EXT_memory_budget). Without that extension:
+// what the renderer itself has allocated, budget 0. Any thread.
+bool GpuMemoryUse(uint64_t* used, uint64_t* budget);
 
 // RGBA8 -> PNG helper (also used by the texture dumper in main.cpp).
 bool WriteRgbaPngFile(const std::string& path,

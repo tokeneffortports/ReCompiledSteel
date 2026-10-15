@@ -19,8 +19,8 @@
 ## What you need
 
 - **Windows** 10 or 11 (64-bit) with a Vulkan 1.3 graphics card, **or** 64-bit
-  Linux / a Steam Deck, **or** an arm64 Android device with Vulkan 1.3 (tested
-  on a Retroid Pocket Nova)
+  Linux / a Steam Deck, **or** an arm64 Android device with Vulkan 1.3, or 1.1 /
+  1.2 with the extensions the game needs (tested on a Retroid Pocket Nova)
 - **Your own copy of Real Steel** from an Xbox 360: the Xbox Live Arcade game
   and its title update, plus the add-on packs if you have them
 
@@ -73,7 +73,8 @@ Mode**. It holds 60 fps. Saves are in `~/.local/share/realsteel`.
 4. Press **Start**.
 
 A built-in controller works as-is, and touch controls appear when no
-controller is connected. More in [android/README.md](android/README.md).
+controller is connected. The picture follows the way you hold the device, the
+right way up either way round. More in [android/README.md](android/README.md).
 
 **Graphics driver** (Qualcomm/Adreno devices): the game uses the device's own
 driver. The launcher can load a custom Vulkan driver file you choose instead,
@@ -102,10 +103,31 @@ using the game's own shaders translated ahead of time.
   and menus are laid out for the shape. The help bar sits at the bottom of
   the screen, and flashes and screen effects cover the whole picture.
 - 60 fps on a Steam Deck and on a Retroid Pocket Nova at its native 1280x960
+- Older Android drivers that report Vulkan 1.1 or 1.2 can work too, through
+  the extensions they offer; if something is missing the game says what
 
 <img src="docs/images/ultrawide.jpg" alt="A fight at 21:9" width="98%">
 <img src="docs/images/aspect-4-3.jpg" alt="The main menu at 4:3" width="32%"> <img src="docs/images/fight-4-3.jpg" alt="A fight at 4:3" width="32%"> <img src="docs/images/deck-16-10.jpg" alt="The main menu at 16:10, the Steam Deck's shape" width="32%">
 <sub>21:9 ultrawide · 4:3 (the Retroid Pocket Nova's screen) · 16:10 (Steam Deck)</sub>
+
+### Options for slower devices
+
+Phones and older PCs that can't hold 60 fps get a set of options under
+**Graphics**. Every one is **off by default**, so the game looks and plays
+exactly as made unless you turn them on:
+
+- **Internal resolution** down to 540p, 480p or 360p
+- **Crowd** off: no audience in the stands (the biggest single saving in the
+  arena)
+- **Texture quality: Half**: large textures at half size, for less memory and
+  faster loading
+- **Keep game speed**: when the device can't draw 60 frames a second, the
+  game keeps its normal speed and shows fewer frames, instead of running in
+  slow motion
+- **FXAA** in place of MSAA, and depth of field off
+
+**Show frame rate** and **Show memory use** (game, free memory and GPU memory)
+sit in any corner you choose, to see what each option buys you.
 
 ### Settings in the game's own menus
 
@@ -133,15 +155,28 @@ the same add-ons and mods; the panel next to the menu says what is missing.
 
 Drop a robot folder into `mods/` and its parts are in the garage. A mod can
 have its own models, textures, name, stats and price, built on any of the 24
-stock skeletons. When no saved robot uses a removed mod any more, the game
-cleans it up. Making one is a single command to start and one to build: see
-[docs/modding.md](docs/modding.md).
+stock skeletons. The game builds each robot itself when it starts, from your
+own copy of the game, so a mod is just its models and pictures: no game data,
+nothing to run. If a robot can't be loaded (missing add-ons, a model with a
+problem) the game says which and why. When no saved robot uses a removed mod
+any more, the game cleans it up. Making one: [docs/modding.md](docs/modding.md).
+
+Two new robots made for this project come with every release as a separate,
+optional download (**ReCompiledSteel-mods-….zip**, public domain): **ANGLER**,
+a deep-sea salvage diving suit with an anglerfish lure, and **QUILLBACK**, a
+spiked speedster with seven glowing gems caged in its waist. Both light up in
+the glow colour you pick.
+
+<img src="docs/images/new-robots.jpg" alt="ANGLER against QUILLBACK in local multiplayer" width="70%">
 
 ### And the rest
 
 - **Achievements** with unlock pop-ups, and the full list in the game's menus
 - **Keyboard controls** you can rebind, next to any controller the system
-  knows, and touch controls on Android
+  knows
+- **Touch controls** on Android that you can arrange: drag any button where
+  you want it, and change its size, shape (circle, rounded, square or a
+  curved kidney) and angle, plus overall size and see-through
 - **Local multiplayer** on one PC with two controllers
 - All 18 **add-on packs** (robots and stages), when you have them
 - A **Cheats** tab (game speed, cash), English or Japanese, mute in the
@@ -180,7 +215,8 @@ for your PC, Steam Deck or handheld, this is for you.
   port the panel shows.
 - At 4:3 and 16:10, the full-screen fades in fights only cover the 16:9 part of
   the picture.
-- On Android only the Retroid Pocket Nova has been tested.
+- On Android, the Retroid Pocket Nova is the main test device; a few phones
+  have been tried too.
 
 ## Reporting problems
 

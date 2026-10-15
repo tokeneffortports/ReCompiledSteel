@@ -12,6 +12,9 @@
 #ifdef __ANDROID__
 #include <android/native_window.h>
 #endif
+#ifndef _WIN32
+#include <SDL3/SDL.h>  // message boxes (Linux, Android)
+#endif
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -26,6 +29,7 @@
 #include <atomic>
 #include <ctime>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -111,6 +115,18 @@ REXCVAR_DEFINE_BOOL(realsteel_native_headless, false, "Real Steel",
                     "Render without presenting to a window (unattended tests)");
 REXCVAR_DEFINE_BOOL(realsteel_native_stretch, false, "Real Steel",
                     "Fill the window instead of keeping 16:9 with black bars");
+REXCVAR_DEFINE_BOOL(realsteel_native_prerotate, true, "Real Steel",
+                    "Android: draw the picture turned to the screen panel's own "
+                    "orientation (off: let Android turn it)");
+REXCVAR_DEFINE_BOOL(realsteel_native_crowd, true, "Real Steel",
+                    "Draw the audience in the stands (off: faster on slow devices)");
+REXCVAR_DEFINE_STRING(realsteel_native_texture_quality, "full", "Real Steel",
+                      "Texture quality: full, or half (textures of 256 px and up "
+                      "at half size: less memory and bandwidth, softer)");
+REXCVAR_DEFINE_BOOL(realsteel_native_keep_speed, false, "Real Steel",
+                    "When the renderer falls behind, hand it only the newest "
+                    "frame instead of waiting: the game keeps its speed and "
+                    "shows fewer frames (some screens may flicker)");
 REXCVAR_DEFINE_BOOL(realsteel_native_dof, false, "Real Steel",
                     "Apply the game's depth-of-field blend in the native "
                     "renderer (off matches the xenos plugin's picture)");
@@ -136,24 +152,14 @@ class GuestTextureSource : public rs::vk::TextureSource {
     const size_t raw_bytes = data.size();
     const bool ok =
         rs::capture::DecodeGuestTexture(label, fetch, std::move(data), out);
-    // Diagnostics (rs_native_print.log): what the live path decoded, with an
-    // RGBA checksum + alpha range to compare against the offline dumps.
-    uint64_t sum = 1469598103934665603ull;
-    uint32_t amin = 255, amax = 0;
-    for (size_t i = 0; ok && i < out.rgba.size(); i += 4) {
-      uint32_t px;
-      std::memcpy(&px, out.rgba.data() + i, 4);
-      sum = (sum ^ px) * 1099511628211ull;
-      const uint32_t a = out.rgba[i + 3];
-      amin = a < amin ? a : amin;
-      amax = a > amax ? a : amax;
-    }
+    // Diagnostics (rs_native_print.log): what the live path decoded. (The
+    // RGBA checksum it also printed walked every pixel of every new texture -
+    // removed 2026-10-15; the offline comparisons it served are done.)
     std::printf("[live-tex] %08X fetch=%08X %08X %08X %08X %08X %08X raw=%zu "
-                "-> %s %ux%u layers=%u rgba=%zu sum=%016llX alpha=%u..%u\n",
+                "-> %s %ux%u layers=%u\n",
                 phys, fetch[0], fetch[1], fetch[2], fetch[3], fetch[4],
                 fetch[5], raw_bytes, ok ? "ok" : "FAIL", out.width, out.height,
-                out.layers, out.rgba.size(),
-                static_cast<unsigned long long>(sum), amin, amax);
+                out.layers);
     return ok;
   }
 };
@@ -374,6 +380,22 @@ void WorkerMain() {
     if (!rs::vk::DriverDescription().empty()) {
       REXLOG_INFO("[native-present] GPU {}", rs::vk::DriverDescription());
     }
+    if (!rs::vk::InitError().empty()) {
+      // The GPU or its driver cannot run the renderer: say so and close,
+      // rather than leaving a game without a picture.
+      REXLOG_ERROR("[native-present] {}", rs::vk::InitError());
+      const std::string text = rs::vk::InitError() +
+                               ".\n\nReCompiled Steel needs a Vulkan 1.3 graphics driver, or a "
+                               "Vulkan 1.1 / 1.2 driver with these features as extensions.";
+#ifdef _WIN32
+      MessageBoxA(nullptr, text.c_str(), "ReCompiled Steel", MB_OK | MB_ICONINFORMATION);
+#else
+      SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "ReCompiled Steel", text.c_str(), nullptr);
+#endif
+      rex::FlushLogging();
+      std::fflush(stdout);
+      std::_Exit(1);
+    }
     g_failed.store(true);
     return;
   }
@@ -449,7 +471,7 @@ void WorkerMain() {
       shot_countdown = 1;
       shot_to_screenshots = true;
     }
-    if (shot_countdown == 0 && (frames & 7) == 0) {
+    if (shot_countdown == 0 && (frames % 30) == 0) {  // (file checks are slow on /sdcard)
       std::error_code shot_ec;
       if (std::filesystem::exists("gpuprof.trigger", shot_ec)) {
         std::filesystem::remove("gpuprof.trigger", shot_ec);
@@ -494,6 +516,9 @@ void WorkerMain() {
     g_picture_aspect.store(aspect);
     renderer->SetAspectMask2D(REXCVAR_GET(realsteel_native_aspect_mask_2d));
     renderer->SetFullCapture(REXCVAR_GET(realsteel_capture_full));
+    renderer->SetPrerotate(REXCVAR_GET(realsteel_native_prerotate));
+    renderer->SetLowEnd(REXCVAR_GET(realsteel_native_crowd),
+                        REXCVAR_GET(realsteel_native_texture_quality) == "half");
     renderer->SetVsync(WantVsync());
     renderer->SetQuality(
         AntiAliasing().msaa,
@@ -808,11 +833,14 @@ void Publish(uint8_t* base, Handoff& bytes) {
   // worker is still busy with the previous frame, wait for it (bounded, so a
   // stuck renderer cannot hang the game); this also paces the guest to the
   // renderer.
-  if (!g_pending.empty()) {
+  // "Keep game speed" (off by default): don't wait - the newest frame
+  // replaces one the worker has not taken, so a slow GPU shows fewer frames
+  // instead of slowing the game down.
+  if (!g_pending.empty() && !REXCVAR_GET(realsteel_native_keep_speed)) {
     g_consumed_cv.wait_for(lock, std::chrono::milliseconds(200),
                            [] { return g_pending.empty() || g_failed.load(); });
-    if (!g_pending.empty()) ++g_dropped;  // gave up: replace
   }
+  if (!g_pending.empty()) ++g_dropped;  // replaced unseen
   // Swap, not copy: a fight frame is 5-8 MB. The caller gets the buffer the
   // worker finished with back (capacity kept on both sides).
   g_pending.swap(bytes);

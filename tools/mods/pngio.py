@@ -104,7 +104,7 @@ def quantize(img, colours=256):
         return palette, inverse.reshape(h, w).astype(np.uint8)
     coarse = ((flat[:, 0] >> 3) << 10) | ((flat[:, 1] >> 3) << 5) | (flat[:, 2] >> 3)
     bins, binv, counts = np.unique(coarse, return_inverse=True, return_counts=True)
-    top = np.argsort(-counts)[:colours]
+    top = np.argsort(-counts, kind="stable")[:colours]      # ties: lower bin first (as the game's builder)
     sums = np.zeros((len(bins), 3))
     np.add.at(sums, binv, flat)
     palette = (sums[top] / counts[top][:, None]).round().astype(np.int32)

@@ -51,6 +51,8 @@
 #ifndef _WIN32
 #include <atomic>
 #include <cerrno>
+#include <csetjmp>
+#include <csignal>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -277,8 +279,23 @@ uint64_t BankFnv1a64(const uint8_t* data, size_t size) {
 
 // Snapshots |bytes| of guest memory into the building frame's payload blob,
 // deduped by content. Caller must hold g_capture_mutex.
+// 2026-10-15: consecutive draws mostly carry the same banks; comparing with
+// the previous snapshot of the same bank skips the hash (and the map) then.
+struct BankMemo {
+  uint64_t frame = ~0ull;
+  uint32_t va = 0, bytes = 0, offset = 0;
+};
+BankMemo g_bank_memo[4];
+
 uint32_t SnapshotBank(uint8_t* base, uint32_t va, uint32_t bytes) {
   const uint8_t* src = base + va;
+  BankMemo& memo = g_bank_memo[(va >> 12) & 3];
+  if (memo.frame == g_building_frame.index && memo.va == va && memo.bytes == bytes &&
+      size_t(memo.offset) + bytes <= g_building_frame.payload_blob.size() &&
+      std::memcmp(g_building_frame.payload_blob.data() + memo.offset, src, bytes) == 0) {
+    return memo.offset;
+  }
+  const uint32_t found = [&]() -> uint32_t {
   const uint64_t hash = BankFnv1a64(src, bytes) ^ bytes;
   const auto it = g_frame_bank_offsets.find(hash);
   if (it != g_frame_bank_offsets.end()) {
@@ -293,6 +310,14 @@ uint32_t SnapshotBank(uint8_t* base, uint32_t va, uint32_t bytes) {
   const uint32_t offset = static_cast<uint32_t>(old_size);
   g_frame_bank_offsets.emplace(hash, offset);
   return offset;
+  }();
+  if (found != kInvalidPayloadOffset) {
+    memo.frame = g_building_frame.index;
+    memo.va = va;
+    memo.bytes = bytes;
+    memo.offset = found;
+  }
+  return found;
 }
 
 // Host-side SetStreamSource shadow (v4.1). The first v4 capture read the
@@ -800,6 +825,9 @@ void OnShaderConstF(uint8_t* base, bool is_pixel, uint32_t start_reg,
 uint64_t g_draw_hook_ns = 0;
 uint64_t g_hook_tex_ns = 0;   // CaptureBoundTextures
 uint64_t g_hook_bank_ns = 0;  // constant-bank snapshots
+uint64_t g_ranges_ns = 0;     // frame end: index/vertex/inline data copies
+uint64_t g_ranges_bytes = 0;
+uint64_t g_ranges_count = 0;
 struct HookTimer {
   uint64_t* sink = &g_draw_hook_ns;
   Clock::time_point t0 = Clock::now();
@@ -1034,24 +1062,52 @@ bool GuardedCopy(void* dst, const void* src, size_t bytes) {
   }
 }
 #else
-// Linux: no structured exceptions. process_vm_readv on ourselves copies
-// through the kernel, which reports an unmapped range (EFAULT) instead of
-// faulting. Where the call itself is unavailable (seccomp sandbox) the copy
-// is unguarded, as it was before.
-bool GuardedCopy(void* dst, const void* src, size_t bytes) {
-  static std::atomic<bool> unavailable{false};
-  if (bytes == 0) return true;
-  if (!unavailable.load(std::memory_order_relaxed)) {
-    struct iovec local{dst, bytes};
-    struct iovec remote{const_cast<void*>(src), bytes};
-    const ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    if (n == static_cast<ssize_t>(bytes)) return true;
-    if (n >= 0 || errno == EFAULT) return false;
-    unavailable.store(true);
-    REXLOG_INFO("[native-render] process_vm_readv unavailable (errno {}): "
-                "guest copies are unguarded", errno);
+// Linux / Android: no structured exceptions. 2026-10-15: a plain copy with a
+// SIGSEGV/SIGBUS handler that jumps back out if the range faults - the
+// process_vm_readv this replaces was a system call per range, hundreds a
+// frame (most of the 1.8 ms frame-end hook on the Retroid Pocket Nova).
+// Faults outside a guarded copy go on to the handler that was there before
+// (crash reporter, runtime); Android's libsigchain keeps ART's own first.
+thread_local sigjmp_buf* t_copy_jump = nullptr;
+struct sigaction g_prev_segv {}, g_prev_bus {};
+
+void CopyFaultHandler(int sig, siginfo_t* info, void* context) {
+  if (sigjmp_buf* jump = t_copy_jump) {
+    t_copy_jump = nullptr;
+    siglongjmp(*jump, 1);  // SA_NODEFER: the signal is not left blocked
   }
+  const struct sigaction& prev = sig == SIGBUS ? g_prev_bus : g_prev_segv;
+  if ((prev.sa_flags & SA_SIGINFO) != 0 && prev.sa_sigaction != nullptr) {
+    prev.sa_sigaction(sig, info, context);
+    return;
+  }
+  if ((prev.sa_flags & SA_SIGINFO) == 0 && prev.sa_handler != SIG_DFL &&
+      prev.sa_handler != SIG_IGN && prev.sa_handler != nullptr) {
+    prev.sa_handler(sig);
+    return;
+  }
+  signal(sig, SIG_DFL);  // nobody else: crash as the default would
+  raise(sig);
+}
+
+bool GuardedCopy(void* dst, const void* src, size_t bytes) {
+  static std::once_flag installed;
+  std::call_once(installed, [] {
+    struct sigaction sa {};
+    sa.sa_sigaction = CopyFaultHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_prev_segv);
+    sigaction(SIGBUS, &sa, &g_prev_bus);
+  });
+  if (bytes == 0) return true;
+  sigjmp_buf jump;
+  if (sigsetjmp(jump, 0) != 0) {
+    return false;  // the range faulted (t_copy_jump was cleared)
+  }
+  t_copy_jump = &jump;
   std::memcpy(dst, src, bytes);
+  t_copy_jump = nullptr;
   return true;
 }
 #endif
@@ -1147,6 +1203,8 @@ void OnFrameEnd(uint8_t* base) {
   // GuardedCopy above skips those; a press-start crash on 2026-08-29 came
   // from copying such a range every frame).
   const bool snapshot_ranges = FullCaptureActive();
+  const auto t_ranges = Clock::now();
+  const size_t blob_before = g_building_frame.payload_blob.size();
   for (DrawRecord& draw : g_building_frame.draws) {
     if (draw.kind == DrawKind::kIndexed) {
       if (!snapshot_ranges) {
@@ -1174,6 +1232,10 @@ void OnFrameEnd(uint8_t* base) {
                 base + draw.guest_data, draw.payload_bytes);
     draw.payload_offset = static_cast<uint32_t>(old_size);
   }
+  g_ranges_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             Clock::now() - t_ranges).count());
+  g_ranges_bytes += g_building_frame.payload_blob.size() - blob_before;
+  g_ranges_count += g_frame_range_offsets.size();
   g_frame_range_offsets.clear();
   g_frame_bank_offsets.clear();
 
@@ -1258,9 +1320,12 @@ void OnFrameEnd(uint8_t* base) {
     bank += g_hook_bank_ns;
     if (++frames % 120 == 0) {
       REXLOG_INFO("[native-render] draw hooks per frame: total {:.1f} ms, "
-                  "textures {:.1f} ms, banks {:.1f} ms",
-                  total / 120.0e6, tex / 120.0e6, bank / 120.0e6);
+                  "textures {:.1f} ms, banks {:.1f} ms | frame-end copies {:.2f} ms, "
+                  "{} ranges, {:.1f} MB",
+                  total / 120.0e6, tex / 120.0e6, bank / 120.0e6, g_ranges_ns / 120.0e6,
+                  g_ranges_count / 120, g_ranges_bytes / 120.0 / 1048576.0);
       total = tex = bank = 0;
+      g_ranges_ns = g_ranges_bytes = g_ranges_count = 0;
     }
   }
   g_draw_hook_ns = 0;

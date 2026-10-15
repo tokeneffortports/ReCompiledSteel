@@ -19,6 +19,12 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
+#include <initializer_list>
+#include <mutex>
+#include <atomic>
+#include <thread>
+#include <unordered_set>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -49,7 +55,12 @@ constexpr uint32_t kAttachW = 1280;
 constexpr uint32_t kAttachH = 1024;
 constexpr uint32_t kMaxTextures = 1024;
 constexpr uint32_t kMaxCubeTextures = 128;  // cube heap (set 2); set 1 (3D) same size
-constexpr VkDeviceSize kArenaBytes = 512ull * 1024 * 1024;
+// Upload buffers (2026-10-15): 512 MB per frame slot had been reserved -
+// 1 GB of a phone's RAM - for frames that use about 17 MB (startup, menus,
+// fights on the PC). They start at 128 MB and double, up to the old size,
+// when a frame used more than half (see RenderFrame).
+constexpr VkDeviceSize kArenaStartBytes = 128ull * 1024 * 1024;
+constexpr VkDeviceSize kArenaMaxBytes = 512ull * 1024 * 1024;
 // Shader constants (VS bank, PS bank, shared block per draw: ~9 KB) live in
 // their own storage buffer, read by the shaders at 32-bit offsets
 // (XenosRecomp's shader_common.h as patched, set 4). Until 2026-10-11 they were read through
@@ -361,6 +372,14 @@ class Backend {
   void CreatePipelineCache();
   void SavePipelineCache();
   uint64_t stat_tex_fetch_ns_ = 0, stat_tex_up_ns_ = 0, stat_pipe_ns_ = 0;
+  // Textures new to the frame, decoded in parallel before the pre-pass
+  // (PrefetchTextures); UploadTexture takes them from here.
+  struct Prefetched {
+    bool ok = false;
+    DecodedTexture tex;
+  };
+  std::unordered_map<uint64_t, Prefetched> prefetched_;
+  void PrefetchTextures(const FrameData& frame);
   // Device-local staging for depth -> R32F copies (2026-10-02: staging them in
   // the host-visible arena sent every copy across the bus and back - 13 ms a
   // frame at 2x, 2/3 of the GPU time). Sized for the largest surface at rs_.
@@ -438,6 +457,44 @@ class Backend {
   VkSemaphore render_sem_ = VK_NULL_HANDLE;
   bool swapchain_dirty_ = false;
   bool sc_extent_from_owner_ = false;  // surface has no size of its own
+  // Android pre-rotation (2026-10-15): sc_extent_ stays the window's own
+  // (landscape) size for every layout decision; the swapchain images are
+  // sc_image_extent_, turned sc_quarter_turns_ x 90 degrees clockwise to the
+  // panel's native orientation, and everything drawn into them is turned the
+  // same way (MapRect, the rotation in the present and overlay shaders).
+  VkExtent2D sc_image_extent_ = {0, 0};
+  uint32_t sc_quarter_turns_ = 0;
+  VkSurfaceTransformFlagBitsKHR sc_transform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  VkRect2D MapRect(float x, float y, float w, float h) const {
+    const float W = float(sc_extent_.width), H = float(sc_extent_.height);
+    float nx = x, ny = y, nw = w, nh = h;
+    switch (sc_quarter_turns_) {
+      case 1: nx = H - (y + h); ny = x; nw = h; nh = w; break;
+      case 2: nx = W - (x + w); ny = H - (y + h); break;
+      case 3: nx = y; ny = W - (x + w); nw = h; nh = w; break;
+      default: break;
+    }
+    return {{int32_t(nx + 0.5f), int32_t(ny + 0.5f)}, {uint32_t(nw + 0.5f), uint32_t(nh + 0.5f)}};
+  }
+  VkViewport MapViewport(float x, float y, float w, float h) const {
+    const float W = float(sc_extent_.width), H = float(sc_extent_.height);
+    switch (sc_quarter_turns_) {
+      case 1: return {H - (y + h), x, h, w, 0.0f, 1.0f};
+      case 2: return {W - (x + w), H - (y + h), w, h, 0.0f, 1.0f};
+      case 3: return {y, W - (x + w), h, w, 0.0f, 1.0f};
+      default: return {x, y, w, h, 0.0f, 1.0f};
+    }
+  }
+  void QuarterTurn(float rot[2]) const {
+    static const float kCos[4] = {1.0f, 0.0f, -1.0f, 0.0f};
+    static const float kSin[4] = {0.0f, 1.0f, 0.0f, -1.0f};
+    rot[0] = kCos[sc_quarter_turns_ & 3];
+    rot[1] = kSin[sc_quarter_turns_ & 3];
+  }
+  bool texture_reload_ = false;  // SetLowEnd changed the texture size setting
+  // Measurement only: "rs_exp_skip" lists shader ids (the first 8 hex digits
+  // drawlist.trigger prints); draws using one are not drawn.
+  std::unordered_set<uint32_t> exp_skip_;
 #if defined(__ANDROID__)
   // On a display that is turned from its natural orientation (a phone held
   // in landscape) Android gives currentExtent at the window's size and
@@ -501,6 +558,19 @@ class Backend {
     std::fflush(stdout);
   }
   bool SurfaceLost() const { return surface_lost_; }
+  void SetPrerotate(bool on) {
+    if (on != options_.prerotate) {
+      options_.prerotate = on;
+      swapchain_dirty_ = true;
+    }
+  }
+  void SetLowEnd(bool crowd, bool half_textures) {
+    options_.no_crowd = !crowd;
+    if (half_textures != options_.half_textures) {
+      options_.half_textures = half_textures;
+      texture_reload_ = true;  // the heap is rebuilt at the next frame
+    }
+  }
   void SetQuality(bool msaa, uint32_t anisotropy, float sharpen) {
     options_.no_msaa = !msaa;
     options_.anisotropy = std::min(16u, std::max(1u, anisotropy));
@@ -618,6 +688,11 @@ class Backend {
   uint8_t* arena_ptr_ = nullptr;
   VkDeviceAddress arena_addr_ = 0;
   VkDeviceSize arena_used_ = 0;
+  VkDeviceSize arena_bytes_ = kArenaStartBytes;  // each slot's upload buffer
+  bool arena_grow_ = false;  // a frame ran out: grow before the next one
+  bool CreateArena(FrameSlot& slot);
+  void DestroyArena(FrameSlot& slot);
+  VkDeviceSize arena_peak_ = 0, arena_peak_ever_ = 0;  // per log window / since start
   uint8_t* cbuf_ptr_ = nullptr;          // the current slot's constants buffer
   VkDeviceSize cbuf_used_ = 0;
   VkDescriptorSet cset_ = VK_NULL_HANDLE;
@@ -923,12 +998,78 @@ VkDeviceSize Backend::AllocConst(VkDeviceSize bytes) {
   return at;
 }
 
+// One frame slot's upload buffer (arena_bytes_): host-visible, mapped, for
+// constants, geometry and texture staging.
+bool Backend::CreateArena(FrameSlot& slot) {
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = arena_bytes_;
+  bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+              VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+              VK_BUFFER_USAGE_TRANSFER_DST_BIT |  // per-pass dumps
+              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  VK_CHECK(vkCreateBuffer(device_, &bci, nullptr, &arena_));
+
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(device_, arena_, &req);
+  VkPhysicalDeviceMemoryProperties mem_props;
+  vkGetPhysicalDeviceMemoryProperties(phys_, &mem_props);
+  uint32_t type = UINT32_MAX;
+  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if ((req.memoryTypeBits & (1u << i)) &&
+        (mem_props.memoryTypes[i].propertyFlags & want) == want) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    std::printf("[vk] no host-visible memory type\n");
+    return false;
+  }
+  VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.pNext = &flags;
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex = type;
+  VK_CHECK(vkAllocateMemory(device_, &mai, nullptr, &arena_mem_));
+  VK_CHECK(vkBindBufferMemory(device_, arena_, arena_mem_, 0));
+  VK_CHECK(vkMapMemory(device_, arena_mem_, 0, VK_WHOLE_SIZE, 0,
+                       reinterpret_cast<void**>(&arena_ptr_)));
+  VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  bda.buffer = arena_;
+  arena_addr_ = vkGetBufferDeviceAddress(device_, &bda);
+  slot.arena = arena_;
+  slot.arena_mem = arena_mem_;
+  slot.arena_ptr = arena_ptr_;
+  slot.arena_addr = arena_addr_;
+  return true;
+}
+
+void Backend::DestroyArena(FrameSlot& slot) {
+  if (slot.arena_mem != VK_NULL_HANDLE) {
+    vkUnmapMemory(device_, slot.arena_mem);
+    vkFreeMemory(device_, slot.arena_mem, nullptr);
+  }
+  if (slot.arena != VK_NULL_HANDLE) vkDestroyBuffer(device_, slot.arena, nullptr);
+  slot.arena = VK_NULL_HANDLE;
+  slot.arena_mem = VK_NULL_HANDLE;
+  slot.arena_ptr = nullptr;
+  slot.arena_addr = 0;
+}
+
 VkDeviceSize Backend::Alloc(VkDeviceSize bytes, VkDeviceSize align) {
   arena_used_ = (arena_used_ + align - 1) & ~(align - 1);
   const VkDeviceSize at = arena_used_;
   arena_used_ += bytes;
-  if (arena_used_ > kArenaBytes) {
-    std::printf("[vk] arena exhausted\n");
+  if (arena_used_ > arena_bytes_) {
+    if (!arena_grow_) {
+      std::printf("[vk] upload buffer full (%.0f MB) - it grows before the next frame\n",
+                  double(arena_bytes_) / 1048576.0);
+    }
+    arena_grow_ = true;
     return VkDeviceSize(-1);
   }
   return at;
@@ -938,8 +1079,52 @@ VkDeviceSize Backend::Alloc(VkDeviceSize bytes, VkDeviceSize align) {
 // vkGetInstanceProcAddr replaces the system loader's. Null = system driver.
 PFN_vkGetInstanceProcAddr g_custom_loader = nullptr;
 std::string g_driver_text;
+std::string g_init_error;  // why the device could not be set up, for the player
+std::atomic<VkPhysicalDevice> g_budget_phys{VK_NULL_HANDLE};  // VK_EXT_memory_budget enabled
+
+// The renderer's own GPU memory, for the memory display where the driver
+// has no budget extension (the Retroid Pocket Nova's): every allocation
+// goes through these wrappers of volk's entry points.
+PFN_vkAllocateMemory g_real_allocate = nullptr;
+PFN_vkFreeMemory g_real_free = nullptr;
+std::mutex g_memory_mutex;
+std::unordered_map<VkDeviceMemory, VkDeviceSize> g_memory_sizes;
+std::atomic<uint64_t> g_memory_total{0};
+
+VKAPI_ATTR VkResult VKAPI_CALL TrackedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
+                                                     const VkAllocationCallbacks* callbacks,
+                                                     VkDeviceMemory* memory) {
+  const VkResult r = g_real_allocate(device, info, callbacks, memory);
+  if (r == VK_SUCCESS && memory != nullptr && *memory != VK_NULL_HANDLE) {
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    g_memory_sizes[*memory] = info->allocationSize;
+    g_memory_total.fetch_add(info->allocationSize);
+  }
+  return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedFreeMemory(VkDevice device, VkDeviceMemory memory,
+                                             const VkAllocationCallbacks* callbacks) {
+  if (memory != VK_NULL_HANDLE) {
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    const auto it = g_memory_sizes.find(memory);
+    if (it != g_memory_sizes.end()) {
+      g_memory_total.fetch_sub(it->second);
+      g_memory_sizes.erase(it);
+    }
+  }
+  g_real_free(device, memory, callbacks);
+}
 
 bool Backend::InitVulkan(bool validation) {
+  if (FILE* f = std::fopen("rs_exp_skip", "rb")) {
+    char word[32];
+    while (std::fscanf(f, "%31s", word) == 1) {
+      exp_skip_.insert(uint32_t(std::strtoul(word, nullptr, 16)));
+    }
+    std::fclose(f);
+    std::printf("[vk] EXPERIMENT: skipping draws of %zu shader id(s)\n", exp_skip_.size());
+  }
   if (g_custom_loader != nullptr) {
     volkInitializeCustom(g_custom_loader);
     std::printf("[vk] Vulkan loader: CUSTOM GPU driver (chosen in the launcher)\n");
@@ -1077,24 +1262,130 @@ bool Backend::InitVulkan(bool validation) {
   qci.queueCount = 1;
   qci.pQueuePriorities = &prio;
 
-  VkPhysicalDeviceVulkan13Features f13{
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-  f13.dynamicRendering = VK_TRUE;
-  f13.synchronization2 = VK_TRUE;
-  VkPhysicalDeviceVulkan12Features f12{
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-  f12.pNext = &f13;
-  f12.bufferDeviceAddress = VK_TRUE;
-  f12.runtimeDescriptorArray = VK_TRUE;
-  f12.descriptorBindingPartiallyBound = VK_TRUE;
-  f12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+  // Vulkan 1.3 is the target. A device that reports less (2026-10-13: a
+  // phone with an Adreno 725 whose driver says 1.1) gets the same
+  // features through their extensions where the driver offers them; what
+  // stays missing is named and the renderer stops before vkCreateDevice
+  // (asking a 1.1 driver for 1.3 structures killed the process).
+  const uint32_t api = props.apiVersion;
+  // Tests the path on a 1.3 device: the variable, or a file "rs_vk_compat"
+  // in the working folder (RealSteel/ on Android).
+  bool force_compat = std::getenv("REALSTEEL_VK_COMPAT") != nullptr;
+  if (FILE* f = std::fopen("rs_vk_compat", "rb")) {
+    std::fclose(f);
+    force_compat = true;
+  }
+  const bool core12 = api >= VK_API_VERSION_1_2 && !force_compat;
+  const bool core13 = api >= VK_API_VERSION_1_3 && !force_compat;
+  std::vector<VkExtensionProperties> available;
+  {
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, nullptr);
+    available.resize(count);
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, available.data());
+  }
+  auto has_ext = [&](const char* name) {
+    for (const VkExtensionProperties& e : available) {
+      if (std::strcmp(e.extensionName, name) == 0) return true;
+    }
+    return false;
+  };
+  std::vector<const char*> dev_exts;
+  if (options_.window) dev_exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+  std::string missing;
+  auto need_ext = [&](const char* name) {
+    if (has_ext(name)) {
+      dev_exts.push_back(name);
+    } else {
+      missing += missing.empty() ? name : std::string(", ") + name;
+    }
+  };
+  if (!core12) {
+    need_ext(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);       // (for depth_stencil_resolve)
+    need_ext(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);     // (for dynamic_rendering)
+    need_ext(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    need_ext(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+    need_ext(VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME);
+  }
+  if (!core13) {
+    need_ext(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    need_ext(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+  }
+  if (!core13) {
+    std::printf("[vk] device reports Vulkan %u.%u%s: using extensions for the 1.3 features\n",
+                VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api),
+                force_compat ? " (REALSTEEL_VK_COMPAT)" : "");
+  }
+
+  // What we ask for: the 1.2 / 1.3 feature blocks where they are core, the
+  // extensions' own feature structures otherwise. The "s" twins receive
+  // what the device offers.
+  VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+  VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+  VkPhysicalDeviceDynamicRenderingFeatures fdr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+  VkPhysicalDeviceSynchronization2Features fs2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+  VkPhysicalDeviceBufferDeviceAddressFeatures fbda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+  VkPhysicalDeviceDescriptorIndexingFeatures fdi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+  VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures fsd{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES};
+  VkPhysicalDeviceVulkan13Features s13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+  VkPhysicalDeviceVulkan12Features s12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+  VkPhysicalDeviceDynamicRenderingFeatures sdr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+  VkPhysicalDeviceSynchronization2Features ss2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+  VkPhysicalDeviceBufferDeviceAddressFeatures sbda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+  VkPhysicalDeviceDescriptorIndexingFeatures sdi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+  VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures ssd{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  VkPhysicalDeviceFeatures2 s2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  auto chain = [](void* head, std::initializer_list<void*> rest) {
+    auto* at = static_cast<VkBaseOutStructure*>(head);
+    for (void* next : rest) {
+      at->pNext = static_cast<VkBaseOutStructure*>(next);
+      at = at->pNext;
+    }
+    at->pNext = nullptr;
+  };
+  if (core13) {
+    chain(&f2, {&f12, &f13});
+    chain(&s2, {&s12, &s13});
+  } else if (core12) {
+    chain(&f2, {&f12, &fdr, &fs2});
+    chain(&s2, {&s12, &sdr, &ss2});
+  } else if (missing.empty()) {
+    chain(&f2, {&fbda, &fdi, &fsd, &fdr, &fs2});
+    chain(&s2, {&sbda, &sdi, &ssd, &sdr, &ss2});
+  } else {
+    chain(&f2, {});
+    chain(&s2, {});
+  }
+  // The same switches whichever structure carries them.
+  VkBool32& want_dynamic_rendering = core13 ? f13.dynamicRendering : fdr.dynamicRendering;
+  VkBool32& want_sync2 = core13 ? f13.synchronization2 : fs2.synchronization2;
+  VkBool32& want_bda = core12 ? f12.bufferDeviceAddress : fbda.bufferDeviceAddress;
+  VkBool32& want_rda = core12 ? f12.runtimeDescriptorArray : fdi.runtimeDescriptorArray;
+  VkBool32& want_pb = core12 ? f12.descriptorBindingPartiallyBound : fdi.descriptorBindingPartiallyBound;
+  VkBool32& want_vdc = core12 ? f12.descriptorBindingVariableDescriptorCount
+                              : fdi.descriptorBindingVariableDescriptorCount;
+  VkBool32& want_uab = core12 ? f12.descriptorBindingSampledImageUpdateAfterBind
+                              : fdi.descriptorBindingSampledImageUpdateAfterBind;
+  VkBool32& want_uuwp = core12 ? f12.descriptorBindingUpdateUnusedWhilePending
+                               : fdi.descriptorBindingUpdateUnusedWhilePending;
+  VkBool32& want_nui = core12 ? f12.shaderSampledImageArrayNonUniformIndexing
+                              : fdi.shaderSampledImageArrayNonUniformIndexing;
+  VkBool32& want_sdsl = core12 ? f12.separateDepthStencilLayouts : fsd.separateDepthStencilLayouts;
+  want_dynamic_rendering = VK_TRUE;
+  want_sync2 = VK_TRUE;
+  want_bda = VK_TRUE;
+  want_rda = VK_TRUE;
+  want_pb = VK_TRUE;
+  want_vdc = VK_TRUE;
   // Snapshots/resolves write heap descriptors while the sets are bound in
   // the recording command buffer; that needs update-after-bind heaps.
-  f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
-  f12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
-  f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-  f2.pNext = &f12;
+  want_uab = VK_TRUE;
+  want_uuwp = VK_TRUE;
+  want_nui = VK_TRUE;
+  want_sdsl = VK_TRUE;  // depth-only image layouts
   {
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(phys_, &supported);
@@ -1108,65 +1399,106 @@ bool Backend::InitVulkan(bool validation) {
   f2.features.shaderInt64 = VK_TRUE;  // 64-bit push-constant addresses
   f2.features.robustBufferAccess = VK_TRUE;  // OOB reads return zero
   f2.features.logicOp = VK_TRUE;  // --vkflatps rasterization proof
-  {
+  if (missing.empty()) {
     // What the device offers (2026-10-11: the Adreno 740 driver refused the
     // device with VK_ERROR_FEATURE_NOT_PRESENT). Optional features are only
     // asked for when present; every missing one is reported.
-    VkPhysicalDeviceVulkan13Features s13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceVulkan12Features s12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    s12.pNext = &s13;
-    VkPhysicalDeviceFeatures2 s2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    s2.pNext = &s12;
     vkGetPhysicalDeviceFeatures2(phys_, &s2);
-    auto check = [](const char* name, VkBool32& wanted, VkBool32 have, bool optional) {
-      if (wanted && !have) {
+    auto have = [&](VkBool32 VkPhysicalDeviceVulkan12Features::*core,
+                    VkBool32 VkPhysicalDeviceDescriptorIndexingFeatures::*ext) {
+      return core12 ? s12.*core : sdi.*ext;
+    };
+    auto check = [&](const char* name, VkBool32& wanted, VkBool32 got, bool optional) {
+      if (wanted && !got) {
         std::printf("[vk] device lacks %s%s\n", name, optional ? " (optional: not used)" : "");
-        if (optional) wanted = VK_FALSE;
+        if (optional) {
+          wanted = VK_FALSE;
+        } else {
+          missing += missing.empty() ? name : std::string(", ") + name;
+        }
       }
     };
     check("logicOp", f2.features.logicOp, s2.features.logicOp, true);
     check("robustBufferAccess", f2.features.robustBufferAccess, s2.features.robustBufferAccess, true);
     check("shaderInt64", f2.features.shaderInt64, s2.features.shaderInt64, true);
-    check("bufferDeviceAddress", f12.bufferDeviceAddress, s12.bufferDeviceAddress, false);
-    check("runtimeDescriptorArray", f12.runtimeDescriptorArray, s12.runtimeDescriptorArray, false);
-    check("descriptorBindingPartiallyBound", f12.descriptorBindingPartiallyBound,
-          s12.descriptorBindingPartiallyBound, false);
-    check("descriptorBindingVariableDescriptorCount", f12.descriptorBindingVariableDescriptorCount,
-          s12.descriptorBindingVariableDescriptorCount, false);
-    check("descriptorBindingSampledImageUpdateAfterBind",
-          f12.descriptorBindingSampledImageUpdateAfterBind,
-          s12.descriptorBindingSampledImageUpdateAfterBind, false);
-    check("descriptorBindingUpdateUnusedWhilePending", f12.descriptorBindingUpdateUnusedWhilePending,
-          s12.descriptorBindingUpdateUnusedWhilePending, false);
-    check("shaderSampledImageArrayNonUniformIndexing",
-          f12.shaderSampledImageArrayNonUniformIndexing,
-          s12.shaderSampledImageArrayNonUniformIndexing, false);
-    check("dynamicRendering", f13.dynamicRendering, s13.dynamicRendering, false);
-    check("synchronization2", f13.synchronization2, s13.synchronization2, false);
-    std::fflush(stdout);
+    check("separateDepthStencilLayouts", want_sdsl,
+          core12 ? s12.separateDepthStencilLayouts : ssd.separateDepthStencilLayouts, true);
+    check("bufferDeviceAddress", want_bda, core12 ? s12.bufferDeviceAddress : sbda.bufferDeviceAddress, false);
+    check("runtimeDescriptorArray", want_rda,
+          have(&VkPhysicalDeviceVulkan12Features::runtimeDescriptorArray,
+               &VkPhysicalDeviceDescriptorIndexingFeatures::runtimeDescriptorArray), false);
+    check("descriptorBindingPartiallyBound", want_pb,
+          have(&VkPhysicalDeviceVulkan12Features::descriptorBindingPartiallyBound,
+               &VkPhysicalDeviceDescriptorIndexingFeatures::descriptorBindingPartiallyBound), false);
+    check("descriptorBindingVariableDescriptorCount", want_vdc,
+          have(&VkPhysicalDeviceVulkan12Features::descriptorBindingVariableDescriptorCount,
+               &VkPhysicalDeviceDescriptorIndexingFeatures::descriptorBindingVariableDescriptorCount), false);
+    check("descriptorBindingSampledImageUpdateAfterBind", want_uab,
+          have(&VkPhysicalDeviceVulkan12Features::descriptorBindingSampledImageUpdateAfterBind,
+               &VkPhysicalDeviceDescriptorIndexingFeatures::descriptorBindingSampledImageUpdateAfterBind),
+          false);
+    check("descriptorBindingUpdateUnusedWhilePending", want_uuwp,
+          have(&VkPhysicalDeviceVulkan12Features::descriptorBindingUpdateUnusedWhilePending,
+               &VkPhysicalDeviceDescriptorIndexingFeatures::descriptorBindingUpdateUnusedWhilePending),
+          false);
+    check("shaderSampledImageArrayNonUniformIndexing", want_nui,
+          have(&VkPhysicalDeviceVulkan12Features::shaderSampledImageArrayNonUniformIndexing,
+               &VkPhysicalDeviceDescriptorIndexingFeatures::shaderSampledImageArrayNonUniformIndexing),
+          false);
+    check("dynamicRendering", want_dynamic_rendering,
+          core13 ? s13.dynamicRendering : sdr.dynamicRendering, false);
+    check("synchronization2", want_sync2, core13 ? s13.synchronization2 : ss2.synchronization2, false);
   }
+  if (!missing.empty()) {
+    char why[1024];
+    std::snprintf(why, sizeof(why),
+                  "This device's graphics driver (Vulkan %u.%u) lacks what the renderer needs: %s",
+                  VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api), missing.c_str());
+    g_init_error = why;
+    std::printf("[vk] %s\n", why);
+    std::fflush(stdout);
+    return false;
+  }
+  std::fflush(stdout);
 
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.pNext = &f2;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
-  std::vector<const char*> dev_exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-  if (options_.window) {
-    uint32_t count = 0;
-    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, nullptr);
-    std::vector<VkExtensionProperties> available(count);
-    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, available.data());
-    for (const VkExtensionProperties& e : available) {
-      if (std::strcmp(e.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
-        dev_exts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
-        have_hdr_metadata_ = true;
-      }
-    }
-    dci.enabledExtensionCount = uint32_t(dev_exts.size());
-    dci.ppEnabledExtensionNames = dev_exts.data();
+  // Memory use display (Settings > Display > Show memory use): the driver's
+  // own figures where it offers them.
+  if (has_ext(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+    dev_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    g_budget_phys = phys_;
   }
+  if (options_.window && has_ext(VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
+    dev_exts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+    have_hdr_metadata_ = true;
+  }
+  dci.enabledExtensionCount = uint32_t(dev_exts.size());
+  dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
   VK_CHECK(vkCreateDevice(phys_, &dci, nullptr, &device_));
   volkLoadDevice(device_);
+  if (vkAllocateMemory != TrackedAllocateMemory) {
+    g_real_allocate = vkAllocateMemory;
+    g_real_free = vkFreeMemory;
+    vkAllocateMemory = TrackedAllocateMemory;
+    vkFreeMemory = TrackedFreeMemory;
+  }
+  if (!core13) {
+    // The extensions' entry points under the core names the renderer calls.
+    vkCmdBeginRendering = vkCmdBeginRenderingKHR;
+    vkCmdEndRendering = vkCmdEndRenderingKHR;
+    vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
+  }
+  if (!core12) vkGetBufferDeviceAddress = vkGetBufferDeviceAddressKHR;
+  if (vkCmdBeginRendering == nullptr || vkCmdEndRendering == nullptr ||
+      vkCmdPipelineBarrier2 == nullptr || vkGetBufferDeviceAddress == nullptr) {
+    g_init_error = "This device's graphics driver did not provide the rendering functions it listed";
+    std::printf("[vk] %s\n", g_init_error.c_str());
+    std::fflush(stdout);
+    return false;
+  }
   vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
 
   VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1186,51 +1518,13 @@ bool Backend::InitVulkan(bool validation) {
 
   // The arena: one host-visible buffer with a device address, used for
   // constants, geometry and texture staging. One per frame slot.
+  if (const char* mb = std::getenv("REALSTEEL_ARENA_MB")) {  // tests the growth path
+    arena_bytes_ = std::max<VkDeviceSize>(1, std::strtoull(mb, nullptr, 10)) * 1024 * 1024;
+  }
   for (FrameSlot& slot : slots_) {
-  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  bci.size = kArenaBytes;
-  bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-              VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-              VK_BUFFER_USAGE_TRANSFER_DST_BIT |  // per-pass dumps
-              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-  VK_CHECK(vkCreateBuffer(device_, &bci, nullptr, &arena_));
-
-  VkMemoryRequirements req;
-  vkGetBufferMemoryRequirements(device_, arena_, &req);
+  if (!CreateArena(slot)) return false;
   VkPhysicalDeviceMemoryProperties mem_props;
   vkGetPhysicalDeviceMemoryProperties(phys_, &mem_props);
-  uint32_t type = UINT32_MAX;
-  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
-    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    if ((req.memoryTypeBits & (1u << i)) &&
-        (mem_props.memoryTypes[i].propertyFlags & want) == want) {
-      type = i;
-      break;
-    }
-  }
-  if (type == UINT32_MAX) {
-    std::printf("[vk] no host-visible memory type\n");
-    return false;
-  }
-  VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-  flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  mai.pNext = &flags;
-  mai.allocationSize = req.size;
-  mai.memoryTypeIndex = type;
-  VK_CHECK(vkAllocateMemory(device_, &mai, nullptr, &arena_mem_));
-  VK_CHECK(vkBindBufferMemory(device_, arena_, arena_mem_, 0));
-  VK_CHECK(vkMapMemory(device_, arena_mem_, 0, VK_WHOLE_SIZE, 0,
-                       reinterpret_cast<void**>(&arena_ptr_)));
-  VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-  bda.buffer = arena_;
-  arena_addr_ = vkGetBufferDeviceAddress(device_, &bda);
-  slot.arena = arena_;
-  slot.arena_mem = arena_mem_;
-  slot.arena_ptr = arena_ptr_;
-  slot.arena_addr = arena_addr_;
 
   VkBufferCreateInfo cci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   cci.size = kConstBytes;
@@ -1441,6 +1735,44 @@ bool Backend::CreateDescriptors() {
   return true;
 }
 
+// 2026-10-15: a frame that brings in many new textures (a fight starting, a
+// new menu) decoded them one by one on this thread - the 20-40 ms hitches
+// on the Retroid Pocket Nova. They are decoded side by side on a few short-
+// lived threads now; uploads stay on this thread, in the same order.
+void Backend::PrefetchTextures(const FrameData& frame) {
+  std::vector<std::pair<uint32_t, uint64_t>> todo;
+  std::unordered_set<uint64_t> queued;
+  for (const DrawRecord& d : frame.draws) {
+    for (uint32_t s = 0; s < rs::capture::kTextureSlots; ++s) {
+      const uint32_t phys = d.textures[s];
+      if (phys == 0) continue;
+      const uint64_t key = (uint64_t(phys) << 32) ^ d.texture_hash[s];
+      if (texture_index_by_key_.count(key) != 0 || !queued.insert(key).second) continue;
+      todo.emplace_back(phys, d.texture_hash[s]);
+    }
+  }
+  if (todo.size() < 2) return;  // one texture: no gain from a thread
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<Prefetched> results(todo.size());
+  std::atomic<size_t> next{0};
+  auto work = [&]() {
+    for (size_t i = next.fetch_add(1); i < todo.size(); i = next.fetch_add(1)) {
+      results[i].ok = options_.texture_source->Fetch(todo[i].first, todo[i].second, results[i].tex);
+    }
+  };
+  const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+  const size_t helpers = std::min<size_t>(todo.size() - 1, std::min(4u, cores > 2 ? cores - 2 : 1u));
+  std::vector<std::thread> pool;
+  pool.reserve(helpers);
+  for (size_t i = 0; i < helpers; ++i) pool.emplace_back(work);
+  work();
+  for (std::thread& t : pool) t.join();
+  for (size_t i = 0; i < todo.size(); ++i) {
+    prefetched_[(uint64_t(todo[i].first) << 32) ^ todo[i].second] = std::move(results[i]);
+  }
+  stat_tex_fetch_ns_ += uint64_t((std::chrono::steady_clock::now() - t0).count());
+}
+
 // Uploads a decoded RGBA8 texture into the 2D heap; returns its index.
 // Index 0 is a 1x1 white fallback created on first use.
 uint32_t Backend::UploadTexture(uint32_t phys, uint64_t hash) {
@@ -1465,7 +1797,14 @@ uint32_t Backend::UploadTexture(uint32_t phys, uint64_t hash) {
     }
     DecodedTexture tex;
     const auto t_fetch = std::chrono::steady_clock::now();
-    const bool fetched = options_.texture_source->Fetch(phys, hash, tex);
+    bool fetched;
+    if (const auto pf = prefetched_.find(key); pf != prefetched_.end()) {
+      fetched = pf->second.ok;
+      tex = std::move(pf->second.tex);
+      prefetched_.erase(pf);
+    } else {
+      fetched = options_.texture_source->Fetch(phys, hash, tex);
+    }
     const auto t_fetched = std::chrono::steady_clock::now();
     stat_tex_fetch_ns_ += uint64_t((t_fetched - t_fetch).count());
     ++stat_tex_n_;
@@ -1479,6 +1818,11 @@ uint32_t Backend::UploadTexture(uint32_t phys, uint64_t hash) {
     }
     const uint32_t index = UploadDecoded(phys, tex);
     stat_tex_up_ns_ += uint64_t((std::chrono::steady_clock::now() - t_fetched).count());
+    if (index == 0 && arena_grow_) {
+      // The upload buffer ran out (it grows before the next frame): white
+      // for this frame, uploaded again next frame instead of kept white.
+      return texture_indices_[phys] = 0;
+    }
     texture_index_by_key_[key] = index;
     if (overridden) texture_indices_[phys] = rd->second.heap_index;
     return texture_indices_[phys];
@@ -1565,7 +1909,30 @@ void Backend::EnsureCubeFallback() {
   UploadDecoded(0, white);  // cube heap index 0
 }
 
-uint32_t Backend::UploadDecoded(uint32_t phys, const DecodedTexture& tex) {
+uint32_t Backend::UploadDecoded(uint32_t phys, const DecodedTexture& full) {
+  // Half-size textures (low-end setting): 2x2 box filter, 2D textures of
+  // 256 px and up only (small ones and cube maps as they are).
+  DecodedTexture half;
+  const bool halve = options_.half_textures && full.layers == 1 && full.width >= 256 &&
+                     full.height >= 256 && full.rgba.size() >= size_t(full.width) * full.height * 4;
+  if (halve) {
+    half.width = full.width / 2;
+    half.height = full.height / 2;
+    half.layers = 1;
+    half.rgba.resize(size_t(half.width) * half.height * 4);
+    const size_t row = size_t(full.width) * 4;
+    for (uint32_t y = 0; y < half.height; ++y) {
+      const uint8_t* a = full.rgba.data() + size_t(y) * 2 * row;
+      const uint8_t* b = a + row;
+      uint8_t* out = half.rgba.data() + size_t(y) * half.width * 4;
+      for (uint32_t x = 0; x < half.width; ++x, a += 8, b += 8, out += 4) {
+        for (int c = 0; c < 4; ++c) {
+          out[c] = uint8_t((a[c] + a[c + 4] + b[c] + b[c + 4] + 2) >> 2);
+        }
+      }
+    }
+  }
+  const DecodedTexture& tex = halve ? half : full;
   const bool cube = tex.layers == 6;
   if (cube ? cube_count_ >= kMaxCubeTextures : texture_count_ >= kMaxTextures) {
     static bool warned = false;
@@ -2215,6 +2582,20 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
   // after every submit), so the upload arena and command buffer are free.
   // Attachments, resolve targets, textures, pipelines persist — resolve
   // targets deliberately keep last frame's content (temporal feedback).
+  arena_peak_ = std::max(arena_peak_, arena_used_);  // what the last frame used
+  arena_peak_ever_ = std::max(arena_peak_ever_, arena_used_);
+  if ((arena_grow_ || arena_peak_ever_ > arena_bytes_ / 2) && arena_bytes_ < kArenaMaxBytes) {
+    WaitFlight();
+    vkDeviceWaitIdle(device_);
+    arena_bytes_ = std::min(kArenaMaxBytes, arena_bytes_ * 2);
+    for (FrameSlot& slot : slots_) {
+      DestroyArena(slot);
+      if (!CreateArena(slot)) return false;
+    }
+    UseSlot(slot_);
+    std::printf("[vk] upload buffers grown to %.0f MB each\n", double(arena_bytes_) / 1048576.0);
+  }
+  arena_grow_ = false;
   arena_used_ = 0;
   cbuf_used_ = 0;
   PumpMessages();
@@ -2232,7 +2613,8 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     VkSurfaceCapabilitiesKHR caps{};
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_, surface_, &caps) == VK_SUCCESS) {
       const VkExtent2D e = WindowExtent(caps);
-      if (e.width != sc_extent_.width || e.height != sc_extent_.height) {
+      if (e.width != sc_extent_.width || e.height != sc_extent_.height ||
+          (sc_quarter_turns_ != 0 || options_.prerotate) && caps.currentTransform != sc_transform_) {
         swapchain_dirty_ = true;
       }
     }
@@ -2272,8 +2654,9 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     out_w_ = pending_w_;
     out_h_ = pending_h_;
   }
-  const bool heap_reset = rescale || texture_count_ + 320 > kMaxTextures ||
+  const bool heap_reset = rescale || texture_reload_ || texture_count_ + 320 > kMaxTextures ||
                           cube_count_ + 16 > kMaxCubeTextures;
+  texture_reload_ = false;
   if (heap_reset) ResetTextureHeap();
   if (!retired_images_.empty()) WaitFlight();  // the frame in flight may use them
   DestroyRetired();
@@ -2331,7 +2714,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
   // Picture shapes other than 16:9: frames that render the 3D scene (they
   // run a scene composite) show more of it outside the 16:9 band. Screens
   // without 3D are composed for 16:9 - backdrops spill into the extra strips
-  // (the author's versus screen, 2026-10-02); since 2026-10-12 their backdrop
+  // (the versus screen, 2026-10-02); since 2026-10-12 their backdrop
   // tiles are widened to cover the picture instead (Layout2D), and
   // aspect_mask_2d brings back the old black strips.
   frame_is_scene_ = false;
@@ -2376,11 +2759,13 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
   // Pre-pass: constants are replayed on the CPU, so all draw resources are
   // known before recording; upload each draw's textures first (copies must
   // happen outside dynamic rendering).
+  if (options_.texture_source != nullptr) PrefetchTextures(frame);
   for (const DrawRecord& d : frame.draws) {
     for (uint32_t s = 0; s < rs::capture::kTextureSlots; ++s) {
       if (d.textures[s] != 0) UploadTexture(d.textures[s], d.texture_hash[s]);
     }
   }
+  prefetched_.clear();
 
   vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           pipeline_layout_, 0, 4, sets_, 0, nullptr);
@@ -2662,7 +3047,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     }
     ++pass_index;
     if (!options_.dump_passes_dir.empty() && cur_rt != nullptr && Unscaled() &&
-        draws_in_pass != 0 && arena_used_ < kArenaBytes / 2) {
+        draws_in_pass != 0 && arena_used_ < arena_bytes_ / 2) {
       // (arena guard: a frame with hundreds of passes must not starve the
       // draws that follow of constant/vertex space)
       const VkDeviceSize at = Alloc(VkDeviceSize(kWidth) * kHeight * 4, 16);
@@ -3093,6 +3478,18 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
       ++skipped;
       return;
     }
+    if (!exp_skip_.empty() &&
+        (exp_skip_.count(uint32_t(vs->container_fnv >> 32)) != 0 ||
+         exp_skip_.count(uint32_t(ps->container_fnv >> 32)) != 0)) {
+      return;  // measurement switch (rs_exp_skip)
+    }
+    // Crowd off (2026-10-15): the audience in the stands is drawn with these
+    // two vertex shaders (Underworld arena; about 12% of the Retroid Pocket
+    // Nova's GPU time in the arena scene).
+    if (options_.no_crowd) {
+      const uint32_t vs_id = uint32_t(vs->container_fnv >> 32);
+      if (vs_id == 0xF32A48B5u || vs_id == 0xD5D3FAC3u) return;
+    }
     // The title's direct post-process draws (bloom/DOF) read sampler slots
     // 8-19, which captures before v10 did not record: skip them there rather
     // than composite from black inputs (the scene stays as rendered).
@@ -3175,10 +3572,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     } else {
       vb_at = Alloc(vertex_bytes, 16);
       if (vb_at == VkDeviceSize(-1)) { ++skipped; return; }
-      for (uint32_t i = 0; i + 4 <= vertex_bytes; i += 4) {
-        const uint32_t v = LoadBE32(vertex_src + i);
-        std::memcpy(arena_ptr_ + vb_at + i, &v, 4);
-      }
+      rs::capture::CopySwap32(arena_ptr_ + vb_at, vertex_src, vertex_bytes);
       vb_cache[vb_key] = vb_at;
     }
 
@@ -3197,10 +3591,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
       index_count = d.count;
       ib_at = Alloc(size_t(index_count) * 2, 16);
       if (ib_at == VkDeviceSize(-1)) { ++skipped; return; }
-      for (uint32_t i = 0; i < index_count; ++i) {
-        const uint16_t v = uint16_t((src[i * 2] << 8) | src[i * 2 + 1]);
-        std::memcpy(arena_ptr_ + ib_at + i * 2, &v, 2);
-      }
+      rs::capture::CopySwap16(arena_ptr_ + ib_at, src, size_t(index_count) * 2);
       switch (d.primitive_type) {
         case 4: topology = uint32_t(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST); break;
         case 6: topology = uint32_t(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP); break;
@@ -3280,12 +3671,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
                           VkDeviceSize dst) {
       if (snapshot_offset != kInvalidPayloadOffset &&
           size_t(snapshot_offset) + 4096 <= frame.payload_blob.size()) {
-        const uint8_t* src = frame.payload_blob.data() + snapshot_offset;
-        uint8_t* out = cbuf_ptr_ + dst;
-        for (size_t i = 0; i < 4096; i += 4) {
-          const uint32_t v = LoadBE32(src + i);
-          std::memcpy(out + i, &v, 4);
-        }
+        rs::capture::CopySwap32(cbuf_ptr_ + dst, frame.payload_blob.data() + snapshot_offset, 4096);
       } else {
         std::memcpy(cbuf_ptr_ + dst, fallback.data(), fallback.size());
       }
@@ -4166,7 +4552,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // black bars
     att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = {{0, 0}, sc_extent_};
+    ri.renderArea = {{0, 0}, sc_image_extent_};
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &att;
@@ -4188,17 +4574,15 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
         ph = h2;
       }
     }
-    const VkViewport pvp{px, py, pw, ph, 0.0f, 1.0f};
-    VkRect2D psc{{0, 0}, sc_extent_};
+    const VkViewport pvp = MapViewport(px, py, pw, ph);
+    VkRect2D psc = MapRect(0.0f, 0.0f, float(sc_extent_.width), float(sc_extent_.height));
     if (!options_.present_stretch && options_.picture_aspect > 0.0f &&
         options_.aspect_mask_2d && !frame_is_scene_) {
       // 16:9 band of the picture rectangle; the rest stays black.
       const float rel = options_.picture_aspect / (16.0f / 9.0f);
       const float bw = rel > 1.0f ? pw / rel : pw;
       const float bh = rel < 1.0f ? ph * rel : ph;
-      psc.offset = {int32_t(px + (pw - bw) * 0.5f + 0.5f),
-                    int32_t(py + (ph - bh) * 0.5f + 0.5f)};
-      psc.extent = {uint32_t(bw + 0.5f), uint32_t(bh + 0.5f)};
+      psc = MapRect(px + (pw - bw) * 0.5f, py + (ph - bh) * 0.5f, bw, bh);
     }
     vkCmdSetViewport(cmd_, 0, 1, &pvp);
     vkCmdSetScissor(cmd_, 0, 1, &psc);
@@ -4221,6 +4605,9 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
                  options_.fxaa ? 1u : 0u};
     vkCmdPushConstants(cmd_, present_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32,
                        &present_pc);
+    float present_rot[2];
+    QuarterTurn(present_rot);
+    vkCmdPushConstants(cmd_, present_layout_, VK_SHADER_STAGE_VERTEX_BIT, 32, 8, present_rot);
     vkCmdDraw(cmd_, 3, 1, 0, 0);
     DrawOverlay();
     vkCmdEndRendering(cmd_);
@@ -4301,9 +4688,12 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     }
     if (++n % 120 == 0) {
       std::printf("[vk] timing (120 frames): record %.1f ms (%.1f ms of it stalled on the GPU, "
-                  "%.1f stalls), wait for previous frame %.1f ms, submit+present %.1f ms\n",
+                  "%.1f stalls), wait for previous frame %.1f ms, submit+present %.1f ms, "
+                  "upload buffer peak %.1f MB (since start %.1f MB)\n",
                   rec_ns / 120.0e6, stall_ns_ / 120.0e6, stall_count_ / 120.0, wait_ns / 120.0e6,
-                  tail_ns / 120.0e6);
+                  tail_ns / 120.0e6, double(arena_peak_) / 1048576.0,
+                  double(arena_peak_ever_) / 1048576.0);
+      arena_peak_ = 0;
       rec_ns = wait_ns = tail_ns = 0;
       stall_ns_ = stall_count_ = 0;
     }
@@ -4839,13 +5229,39 @@ bool Backend::CreateSwapchain() {
   if (caps.maxImageCount != 0) sci.minImageCount = std::min(sci.minImageCount, caps.maxImageCount);
   sci.imageFormat = sc_format_;
   sci.imageColorSpace = cs;
-  sci.imageExtent = sc_extent_;
+  sc_image_extent_ = sc_extent_;
+  sc_quarter_turns_ = 0;
+  sc_transform_ = caps.currentTransform;
+#if defined(__ANDROID__)
+  // Pre-rotation: when the display is turned from the panel's own
+  // orientation (a phone held sideways; a handheld with a portrait phone
+  // panel mounted sideways, as on some handhelds), draw the picture
+  // turned and tell the compositor so (Android's recommended path).
+  if (options_.prerotate && (caps.supportedTransforms & caps.currentTransform) != 0) {
+    switch (caps.currentTransform) {
+      case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR: sc_quarter_turns_ = 1; break;
+      case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: sc_quarter_turns_ = 2; break;
+      case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: sc_quarter_turns_ = 3; break;
+      default: break;
+    }
+    if (sc_quarter_turns_ & 1) {
+      sc_image_extent_ = {sc_extent_.height, sc_extent_.width};
+      if (sc_image_extent_.width > caps.maxImageExtent.width ||
+          sc_image_extent_.height > caps.maxImageExtent.height) {
+        sc_quarter_turns_ = 0;  // (never expected) the compositor turns it
+        sc_image_extent_ = sc_extent_;
+      }
+    }
+  }
+#endif
+  sci.imageExtent = sc_image_extent_;
   sci.imageArrayLayers = 1;
   sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
   sci.preTransform = caps.currentTransform;
 #if defined(__ANDROID__)
-  sci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;  // (Android always offers it)
+  sci.preTransform = sc_quarter_turns_ != 0 ? caps.currentTransform
+                                            : VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 #endif
   sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
   if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) {
@@ -4906,8 +5322,10 @@ bool Backend::CreateSwapchain() {
     VK_CHECK(vkCreateImageView(device_, &vci, nullptr, &sc_views_[i]));
   }
   swapchain_dirty_ = false;
-  std::printf("[vk] swapchain %ux%u, %u images, display transform 0x%x\n", sc_extent_.width,
-              sc_extent_.height, n, unsigned(caps.currentTransform));
+  std::printf("[vk] swapchain %ux%u (images %ux%u), %u images, display transform 0x%x, "
+              "pre-rotated %u x 90\n", sc_extent_.width, sc_extent_.height,
+              sc_image_extent_.width, sc_image_extent_.height, n,
+              unsigned(caps.currentTransform), sc_quarter_turns_);
   std::fflush(stdout);  // (startup lines reach the file even if a crash follows)
   return true;
 }
@@ -4960,14 +5378,17 @@ bool Backend::EnsurePresentResources() {
     dai.descriptorSetCount = 1;
     dai.pSetLayouts = &present_dsl_;
     VK_CHECK(vkAllocateDescriptorSets(device_, &dai, &present_set_));
-    VkPushConstantRange range{};
-    range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    range.size = 32;  // gamma, sharpen, source texel size, HDR mode/paper/peak, FXAA
+    VkPushConstantRange ranges[2] = {};
+    ranges[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ranges[0].size = 32;  // gamma, sharpen, source texel size, HDR mode/paper/peak, FXAA
+    ranges[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    ranges[1].offset = 32;
+    ranges[1].size = 8;   // pre-rotation (cos, sin)
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
     pli.pSetLayouts = &present_dsl_;
-    pli.pushConstantRangeCount = 1;
-    pli.pPushConstantRanges = &range;
+    pli.pushConstantRangeCount = 2;
+    pli.pPushConstantRanges = ranges;
     VK_CHECK(vkCreatePipelineLayout(device_, &pli, nullptr, &present_layout_));
   }
   if (!present_src_written_) {
@@ -5355,7 +5776,7 @@ void Backend::DrawOverlay() {
   std::memcpy(arena_ptr_ + vb_at, f.vertices.data(), vb_bytes);
   std::memcpy(arena_ptr_ + ib_at, f.indices.data(), ib_bytes);
   const float sw = float(sc_extent_.width), sh = float(sc_extent_.height);
-  const VkViewport vp{0.0f, 0.0f, sw, sh, 0.0f, 1.0f};
+  const VkViewport vp = MapViewport(0.0f, 0.0f, sw, sh);
   vkCmdSetViewport(cmd_, 0, 1, &vp);
   vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pipeline_);
   const float xform[4] = {2.0f / f.width, 2.0f / f.height, -1.0f, -1.0f};
@@ -5363,8 +5784,9 @@ void Backend::DrawOverlay() {
     float xform[4];
     uint32_t mode;
     float paper;
-    float unused[2];
-  } overlay_pc{{xform[0], xform[1], xform[2], xform[3]}, hdr_mode_, options_.hdr_paper_nits, {0, 0}};
+    float rot[2];
+  } overlay_pc{{xform[0], xform[1], xform[2], xform[3]}, hdr_mode_, options_.hdr_paper_nits, {1, 0}};
+  QuarterTurn(overlay_pc.rot);
   vkCmdPushConstants(cmd_, overlay_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, 32, &overlay_pc);
   vkCmdBindVertexBuffers(cmd_, 0, 1, &arena_, &vb_at);
@@ -5377,8 +5799,8 @@ void Backend::DrawOverlay() {
     const float l = std::max(0.0f, d.left * kx), t = std::max(0.0f, d.top * ky);
     const float r = std::min(sw, d.right * kx), b = std::min(sh, d.bottom * ky);
     if (r <= l || b <= t) continue;
-    const VkRect2D sc{{int32_t(l), int32_t(t)},
-                      {uint32_t(r) - uint32_t(l), uint32_t(b) - uint32_t(t)}};
+    const VkRect2D sc = MapRect(float(int32_t(l)), float(int32_t(t)),
+                                float(uint32_t(r) - uint32_t(l)), float(uint32_t(b) - uint32_t(t)));
     if (sc.extent.width == 0 || sc.extent.height == 0) continue;
     vkCmdSetScissor(cmd_, 0, 1, &sc);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_layout_,
@@ -5418,6 +5840,10 @@ void Renderer::SetLiveOptions(uint32_t internal_width, uint32_t internal_height,
                                       present_stretch, output_gamma, no_dof);
 }
 void Renderer::SetVsync(bool vsync) { AsBackend(backend_)->SetVsync(vsync); }
+void Renderer::SetPrerotate(bool on) { AsBackend(backend_)->SetPrerotate(on); }
+void Renderer::SetLowEnd(bool crowd, bool half_textures) {
+  AsBackend(backend_)->SetLowEnd(crowd, half_textures);
+}
 void Renderer::SetQuality(bool msaa, uint32_t anisotropy, float sharpen) {
   AsBackend(backend_)->SetQuality(msaa, anisotropy, sharpen);
 }
@@ -5442,6 +5868,30 @@ void SetVulkanLoader(void* get_instance_proc_addr) {
 }
 
 const std::string& DriverDescription() { return g_driver_text; }
+const std::string& InitError() { return g_init_error; }
+
+bool GpuMemoryUse(uint64_t* used, uint64_t* budget) {
+  const VkPhysicalDevice phys = g_budget_phys.load();
+  if (phys == VK_NULL_HANDLE || vkGetPhysicalDeviceMemoryProperties2 == nullptr) {
+    *used = g_memory_total.load();  // the renderer's own allocations
+    *budget = 0;
+    return *used != 0;
+  }
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+  VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+  mp.pNext = &mb;
+  vkGetPhysicalDeviceMemoryProperties2(phys, &mp);
+  uint64_t u = 0, b = 0;
+  for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; ++i) {
+    if ((mp.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
+    u += mb.heapUsage[i];
+    b += mb.heapBudget[i];
+  }
+  *used = u;
+  *budget = b;
+  return b != 0;
+}
 void Renderer::ProfileGpu(uint32_t frames) { AsBackend(backend_)->ProfileGpu(frames); }
 void Renderer::LastReadbackSize(uint32_t& width, uint32_t& height) const {
   AsBackend(backend_)->LastReadbackSize(width, height);

@@ -1,6 +1,7 @@
 #include "realsteel_overlay.h"
 
 #include "realsteel_keyboard.h"
+#include "realsteel_mods_pack.h"
 #include "realsteel_icon.h"
 #include "realsteel_native_present.h"
 #include "realsteel_netplay.h"
@@ -27,6 +28,20 @@
 #include <vector>
 
 #include <imgui.h>
+#include <imgui_internal.h>  // ClearActiveID (touch scrolling)
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>  // K32GetProcessMemoryInfo (in kernel32)
+#else
+#include <unistd.h>  // sysconf
+#endif
 
 #include <rex/cvar.h>
 #include <rex/input/input.h>
@@ -44,6 +59,12 @@
 
 REXCVAR_DEFINE_BOOL(realsteel_mute_background, true, "Real Steel",
                     "Mute the game while its window is not focused");
+REXCVAR_DEFINE_BOOL(realsteel_show_memory, false, "Real Steel",
+                    "Show the game's memory use, the device's free memory and "
+                    "graphics memory next to the frame rate counter");
+REXCVAR_DEFINE_STRING(realsteel_fps_position, "top_left", "Real Steel",
+                      "Where the frame rate counter sits: top_left, top_right, "
+                      "bottom_left, bottom_right");
 REXCVAR_DEFINE_BOOL(realsteel_show_fps, false, "Real Steel",
                     "Show the native renderer's frame rate in the corner");
 REXCVAR_DEFINE_BOOL(realsteel_vibration, true, "Real Steel",
@@ -83,6 +104,7 @@ struct Setting {
 
 void ApplyFullscreen();
 void RequestQuit();
+void ArrangeTouch();
 
 // Cheats: the game's cash is a 32-bit word at a fixed address in its data
 // (found 2026-10-11 by scanning for the amount the garage shows; the game
@@ -143,7 +165,20 @@ const std::vector<Setting>& Settings() {
        "How bright ordinary white is, in nits: menus, text and most of the "
        "picture. Raise it if HDR looks dim.", {}, 80.0f, 400.0f},
       {"Display", "Show frame rate", "realsteel_show_fps", Kind::kToggle, "false",
-       "Frame rate counter in the top left corner."},
+       "Frame rate counter in a corner of the screen."},
+      {"Display", "Show memory use", "realsteel_show_memory", Kind::kToggle, "false",
+       "Memory the game uses, memory still free on the device, and graphics "
+       "memory where the driver reports it. Shown with the frame rate counter."},
+      {"Display", "Frame rate position", "realsteel_fps_position", Kind::kChoice, "top_left",
+       "Which corner the frame rate counter and memory use sit in.",
+       {{"Top left", "top_left"}, {"Top right", "top_right"},
+        {"Bottom left", "bottom_left"}, {"Bottom right", "bottom_right"}}},
+#ifdef __ANDROID__
+      {"Display", "Screen rotation", "realsteel_native_prerotate", Kind::kChoice, "true",
+       "How the picture is turned to fit the screen panel. If the picture is "
+       "sideways or stretched on your device, try the other setting.",
+       {{"Game (recommended)", "true"}, {"Android", "false"}}},
+#endif
       // ----------------------------------------------------------- Graphics
       {"Graphics", "Internal resolution", "realsteel_native_resolution",
        Kind::kChoice, "1280x720",
@@ -180,6 +215,19 @@ const std::vector<Setting>& Settings() {
         {"Anisotropic 16x", "16"}}},
       {"Graphics", "Depth of field", "realsteel_native_dof", Kind::kToggle,
        "false", "The game's background blur."},
+      // Low-end options (2026-10-15): the defaults are the game as made.
+      {"Graphics", "Crowd", "realsteel_native_crowd", Kind::kToggle, "true",
+       "The audience in the stands. Off is faster on slow devices."},
+      {"Graphics", "Texture quality", "realsteel_native_texture_quality", Kind::kChoice,
+       "full",
+       "Half loads large textures at half size: less memory and faster on slow "
+       "devices, but surfaces and some text look softer.",
+       {{"Full", "full"}, {"Half (faster)", "half"}}},
+      {"Graphics", "Keep game speed", "realsteel_native_keep_speed", Kind::kToggle,
+       "false",
+       "For devices that cannot draw 60 frames a second: the game keeps its "
+       "normal speed and shows fewer frames, instead of running in slow motion. "
+       "Some screens may flicker or miss an image."},
       // -------------------------------------------------------------- Audio
       {"Audio", "Mute in background", "realsteel_mute_background", Kind::kToggle, "true",
        "Silence the game while another window has the focus."},
@@ -197,6 +245,14 @@ const std::vector<Setting>& Settings() {
        "On-screen buttons for touch screens. Automatic shows them only when no "
        "controller is connected. The ... button at the top opens this page.",
        {{"Automatic", "auto"}, {"On", "on"}, {"Off", "off"}}},
+      {"Controls", "Touch controls size", "realsteel_touch_size", Kind::kSlider, "1",
+       "Size of the on-screen buttons and stick. 1 is the original size.", {}, 0.6f, 1.6f},
+      {"Controls", "Touch controls opacity", "realsteel_touch_opacity", Kind::kSlider, "1",
+       "How visible the on-screen controls are. 1 is the original look.", {}, 0.2f, 1.0f},
+      {"Controls", "Arrange touch controls", "", Kind::kAction, "ARRANGE",
+       "Closes this page and shows the touch controls with outlines: drag them "
+       "where you want them, then press DONE (RESET puts the original layout back).",
+       {}, 0, 1, &ArrangeTouch},
       {"Controls", "Keyboard controls", "realsteel_keyboard", Kind::kToggle, "true",
        "The keys below act as pad 0 (with or without a controller plugged "
        "in). Click a key to change it, then press the new key."},
@@ -286,6 +342,7 @@ bool SameValue(const std::string& a, const char* b) {
 // Kept in the settings file without a row on the page.
 constexpr const char* kStoredOnly[] = {
     "realsteel_online_xuid",  // this player's online identity, made on first run
+    "realsteel_touch_layout",  // where Arrange touch controls moved the controls
 };
 // Read from older settings files only, to carry them over (LoadSavedSettings).
 constexpr const char* kLegacy[] = {
@@ -490,6 +547,18 @@ void RequestQuit() {
   });
 }
 
+void SetPageOpen(bool open);
+
+// Settings > Controls > Arrange touch controls: close the page and let the
+// fingers move the controls (realsteel_touch.cpp).
+void ArrangeTouch() {
+  if (g_app_context == nullptr) return;
+  g_app_context->CallInUIThreadDeferred([] {
+    SetPageOpen(false);
+    realsteel::touch::BeginArrange();
+  });
+}
+
 void SetValue(const Setting& s, const std::string& value) {
   if (!rex::cvar::SetFlagByName(s.cvar, value)) {
     REXLOG_INFO("[settings] {} = {} was rejected", s.cvar, value);
@@ -497,6 +566,37 @@ void SetValue(const Setting& s, const std::string& value) {
   }
   if (s.on_change != nullptr) s.on_change();
   SaveSettings();
+}
+
+// Touch scrolling (2026-10-15): ImGui scrolls a
+// list only by its scrollbar or a wheel, and the scrollbar is a thin target
+// for a finger. Call inside a child window: a press that moves more than a
+// few pixels up or down scrolls the list instead; one that started on a
+// button gives the button up. Slider drags (g_slider_active, set by the
+// rows) and the scrollbar keep theirs.
+bool g_slider_active = false;
+void TouchScroll(float ui) {
+  ImGuiIO& io = ImGui::GetIO();
+  static ImGuiID scrolling = 0;  // the window being scrolled
+  // (GetCurrentContext, not GetCurrentWindow: the runtime DLL keeps GImGui to itself.)
+  ImGuiWindow* window = ImGui::GetCurrentContext()->CurrentWindow;
+  if (!io.MouseDown[0]) {
+    scrolling = 0;
+    return;
+  }
+  if (scrolling == window->ID) {
+    ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+    return;
+  }
+  if (scrolling != 0 || g_slider_active || window->ScrollMax.y <= 0.0f) return;
+  if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) return;
+  // Not when the press began on the scrollbar (it scrolls by itself).
+  const ImRect bar = ImGui::GetWindowScrollbarRect(window, ImGuiAxis_Y);
+  if (bar.Contains(io.MouseClickedPos[0])) return;
+  if (std::fabs(io.MouseClickedPos[0].y - io.MousePos.y) > 12.0f * ui) {
+    scrolling = window->ID;
+    ImGui::ClearActiveID();  // the button under the finger is not pressed
+  }
 }
 
 class SettingsPage : public rex::ui::ImGuiDialog {
@@ -584,8 +684,10 @@ class SettingsPage : public rex::ui::ImGuiDialog {
         most_rows = n > most_rows ? n : most_rows;
       }
       const int visible_rows = most_rows > 11 ? 11 : most_rows;
+      ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, (realsteel::touch::HasTouch() ? 28.0f : 14.0f) * ui);
       ImGui::BeginChild("##rows", ImVec2(0.0f, ImGui::GetFrameHeightWithSpacing() * visible_rows + 4.0f * ui),
                         ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+      g_slider_active = false;
       for (const Setting& s : Settings()) {
         if (std::strcmp(s.section, sections[tab_]) != 0) continue;
         ++rows;
@@ -661,8 +763,10 @@ class SettingsPage : public rex::ui::ImGuiDialog {
             float v = float(std::strtod(current.c_str(), nullptr));
             // Wide ranges (HDR nits) in whole numbers, small ones to 2 places.
             const char* format = s.slider_max > 50.0f ? "%.0f" : "%.2f";
-            if (ImGui::SliderFloat("##v", &v, s.slider_min, s.slider_max, format,
-                                   ImGuiSliderFlags_AlwaysClamp)) {
+            const bool changed = ImGui::SliderFloat("##v", &v, s.slider_min, s.slider_max, format,
+                                                    ImGuiSliderFlags_AlwaysClamp);
+            if (ImGui::IsItemActive()) g_slider_active = true;
+            if (changed) {
               char text[32];
               std::snprintf(text, sizeof(text), format, v);
               SetValue(s, text);
@@ -677,7 +781,9 @@ class SettingsPage : public rex::ui::ImGuiDialog {
       for (; rows < visible_rows; ++rows) {
         ImGui::Dummy(ImVec2(0.0f, ImGui::GetFrameHeight()));
       }
+      TouchScroll(ui);
       ImGui::EndChild();
+      ImGui::PopStyleVar();
       if (last_tab_ != tab_) {
         last_tab_ = tab_;
         focus_first_row_ = true;  // next frame: the new tab's first control
@@ -754,15 +860,65 @@ class TouchControls : public rex::ui::ImGuiDialog {
 };
 std::unique_ptr<TouchControls> g_touch_controls;
 
+// Memory figures for the counter (2026-10-15): the game's resident memory,
+// the device's available and total memory, and the GPU's own figures.
+struct MemorySample {
+  uint64_t process = 0, available = 0, total = 0, gpu_used = 0, gpu_budget = 0;
+};
+void SampleMemory(MemorySample& m) {
+  m = {};
+#ifdef _WIN32
+  PROCESS_MEMORY_COUNTERS_EX pmc{};
+  pmc.cb = sizeof(pmc);
+  if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                              sizeof(pmc))) {
+    m.process = pmc.PrivateUsage;
+  }
+  MEMORYSTATUSEX ms{};
+  ms.dwLength = sizeof(ms);
+  if (GlobalMemoryStatusEx(&ms)) {
+    m.available = ms.ullAvailPhys;
+    m.total = ms.ullTotalPhys;
+  }
+#else
+  if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+    unsigned long long size = 0, resident = 0;
+    if (std::fscanf(f, "%llu %llu", &size, &resident) == 2) {
+      m.process = resident * uint64_t(sysconf(_SC_PAGESIZE));
+    }
+    std::fclose(f);
+  }
+  if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+    char key[64];
+    unsigned long long kb = 0;
+    while (std::fscanf(f, "%63s %llu kB", key, &kb) == 2) {
+      if (std::strcmp(key, "MemTotal:") == 0) m.total = kb * 1024;
+      if (std::strcmp(key, "MemAvailable:") == 0) m.available = kb * 1024;
+    }
+    std::fclose(f);
+  }
+#endif
+  rs::vk::GpuMemoryUse(&m.gpu_used, &m.gpu_budget);
+}
+
 class FpsCounter : public rex::ui::ImGuiDialog {
  public:
   explicit FpsCounter(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+
+ private:
+  MemorySample mem_;
+  std::chrono::steady_clock::time_point sampled_{};
 
  protected:
   void OnDraw(ImGuiIO& io) override {
     const float ui = UiScale(io);
     ImGui::PushFont(g_font, 17.0f * ui);
-    ImGui::SetNextWindowPos(ImVec2(10.0f * ui, 8.0f * ui), ImGuiCond_Always);
+    const std::string corner = REXCVAR_GET(realsteel_fps_position);
+    const bool right = corner == "top_right" || corner == "bottom_right";
+    const bool bottom = corner == "bottom_left" || corner == "bottom_right";
+    ImGui::SetNextWindowPos(ImVec2(right ? io.DisplaySize.x - 10.0f * ui : 10.0f * ui,
+                                   bottom ? io.DisplaySize.y - 8.0f * ui : 8.0f * ui),
+                            ImGuiCond_Always, ImVec2(right ? 1.0f : 0.0f, bottom ? 1.0f : 0.0f));
     ImGui::SetNextWindowBgAlpha(0.45f);
     if (ImGui::Begin("##realsteel_fps", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
@@ -771,7 +927,22 @@ class FpsCounter : public rex::ui::ImGuiDialog {
                          ImGuiWindowFlags_NoFocusOnAppearing |
                          ImGuiWindowFlags_NoBringToFrontOnFocus |
                          ImGuiWindowFlags_AlwaysAutoResize)) {
-      ImGui::Text("%.0f fps", double(g_fps.load()));
+      if (REXCVAR_GET(realsteel_show_fps)) ImGui::Text("%.0f fps", double(g_fps.load()));
+      if (REXCVAR_GET(realsteel_show_memory)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - sampled_ >= std::chrono::seconds(1)) {
+          sampled_ = now;
+          SampleMemory(mem_);
+        }
+        auto gb = [](uint64_t bytes) { return double(bytes) / (1024.0 * 1024.0 * 1024.0); };
+        if (mem_.process != 0) ImGui::Text("Game  %.2f GB", gb(mem_.process));
+        if (mem_.total != 0) ImGui::Text("Free  %.2f of %.1f GB", gb(mem_.available), gb(mem_.total));
+        if (mem_.gpu_budget != 0) {
+          ImGui::Text("GPU   %.2f of %.1f GB", gb(mem_.gpu_used), gb(mem_.gpu_budget));
+        } else if (mem_.gpu_used != 0) {
+          ImGui::Text("GPU   %.2f GB", gb(mem_.gpu_used));
+        }
+      }
     }
     ImGui::End();
     ImGui::PopFont();
@@ -840,6 +1011,57 @@ class AchievementToast : public rex::ui::ImGuiDialog {
   std::chrono::steady_clock::time_point shown_since_{};
 };
 std::unique_ptr<AchievementToast> g_toast;
+
+// Robots from the mods folder that were not loaded, and why (2026-10-15):
+// shown once after start-up for twenty seconds, bottom centre.
+class ModNotice : public rex::ui::ImGuiDialog {
+ public:
+  ModNotice(rex::ui::ImGuiDrawer* drawer, std::vector<std::string> lines)
+      : ImGuiDialog(drawer), lines_(std::move(lines)) {}
+  bool Done() const { return done_; }
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    const auto now = std::chrono::steady_clock::now();
+    if (since_.time_since_epoch().count() == 0) since_ = now;
+    const float age = std::chrono::duration<float>(now - since_).count();
+    if (age > 20.0f) {
+      done_ = true;
+      return;
+    }
+    const float ui = UiScale(io);
+    const float alpha = std::max(0.0f, std::min(1.0f, std::min(age * 4.0f, (20.0f - age) * 2.0f)));
+    ImGui::PushFont(g_font, 17.0f * ui);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f * ui, 9.0f * ui));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f * ui);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f * ui);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.05f, 0.03f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.72f, 0.3f, 0.9f));
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 24.0f * ui), ImGuiCond_Always,
+                            ImVec2(0.5f, 1.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(io.DisplaySize.x * 0.9f, io.DisplaySize.y * 0.5f));
+    if (ImGui::Begin("##realsteel_mod_notice", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.0f), "MODS");
+      ImGui::PushTextWrapPos(io.DisplaySize.x * 0.85f);
+      for (const std::string& line : lines_) ImGui::TextUnformatted(line.c_str());
+      ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(4);
+    ImGui::PopFont();
+  }
+
+ private:
+  std::vector<std::string> lines_;
+  std::chrono::steady_clock::time_point since_{};
+  bool done_ = false;
+};
+std::unique_ptr<ModNotice> g_mod_notice;
 
 // New unlocks since the last look (the first look only takes stock).
 void PollAchievements() {
@@ -910,6 +1132,7 @@ class AchievementsPage : public rex::ui::ImGuiDialog {
       ImGui::TextColored(ImVec4(0.5f, 0.62f, 0.68f, 1.0f), "  %d / %d unlocked, %u / %u G",
                          unlocked_count_, int(list_.size()), score_, total_score_);
       ImGui::Separator();
+      ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, (realsteel::touch::HasTouch() ? 28.0f : 14.0f) * ui);
       ImGui::BeginChild("##list", ImVec2(0.0f, -ImGui::GetFrameHeightWithSpacing()), ImGuiChildFlags_None,
                         ImGuiWindowFlags_NoBackground);
       if (list_.empty()) ImGui::TextDisabled("No achievement data was loaded.");
@@ -932,7 +1155,10 @@ class AchievementsPage : public rex::ui::ImGuiDialog {
         ImGui::EndGroup();
         ImGui::PopID();
       }
+      g_slider_active = false;
+      TouchScroll(ui);
       ImGui::EndChild();
+      ImGui::PopStyleVar();
       // A button as well as B / Esc: on a touch screen the on-screen pad is
       // hidden while a page is open, so a tap is the only way out.
       if (ImGui::Button("CLOSE")) want_close_ = true;
@@ -1270,11 +1496,21 @@ void UiTick() {
       g_touch_controls.reset();
     }
     if (realsteel::touch::TakeSettingsTap()) SetPageOpen(true);
+    if (realsteel::touch::TakeLayoutSaved()) SaveSettings();
   }
   PollAchievements();
   TickTabStrip();
   if (g_toast != nullptr && g_toast->Idle()) g_toast.reset();
-  const bool want_fps = REXCVAR_GET(realsteel_show_fps);
+  {
+    static bool mod_notice_shown = false;
+    if (!mod_notice_shown) {
+      mod_notice_shown = true;
+      std::vector<std::string> lines = realsteel::mods::Notices();
+      if (!lines.empty()) g_mod_notice = std::make_unique<ModNotice>(g_imgui.get(), std::move(lines));
+    }
+    if (g_mod_notice != nullptr && g_mod_notice->Done()) g_mod_notice.reset();
+  }
+  const bool want_fps = REXCVAR_GET(realsteel_show_fps) || REXCVAR_GET(realsteel_show_memory);
   if (want_fps && g_fps_counter == nullptr) {
     g_fps_counter = std::make_unique<FpsCounter>(g_imgui.get());
   } else if (!want_fps && g_fps_counter != nullptr) {
@@ -1397,6 +1633,7 @@ void Shutdown() {
   g_online_panel.reset();
   g_fps_counter.reset();
   g_toast.reset();
+  g_mod_notice.reset();
   DropTextEntry();
   g_touch_controls.reset();
   g_achievements.reset();
