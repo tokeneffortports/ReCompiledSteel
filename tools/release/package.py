@@ -88,6 +88,9 @@ def windows(build, out, version):
         print('missing %s' % setup, file=sys.stderr)
         return None
     shutil.copy(setup, dest)
+    # Texture packs: makes one from the exported textures (Real-ESRGAN is the
+    # player's own download).
+    shutil.copy(os.path.join(ROOT, 'tools', 'make_texture_pack.ps1'), dest)
     archive = dest + ('-%s' % version if version else '') + '.zip'
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
         for dirpath, _, files in os.walk(dest):

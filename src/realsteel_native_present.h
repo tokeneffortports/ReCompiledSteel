@@ -57,6 +57,9 @@ void SetAndroidBackground(bool background);
 void HoldFrames(bool hold);
 // The picture's shape in use (width / height; 0 = the game's own 16:9).
 float CurrentPictureAspect();
+// The game's main camera (vertical fov in radians, near, far) as last set
+// up, for the renderer's own effects (ambient occlusion).
+void NoteCamera(float fov_y, float near_z, float far_z);
 // Where the game's central 16:9 band (the 1280x720 space that menus and
 // panels keep) lies in a window of |win_w| x |win_h| pixels: x, y, w, h.
 void BandRect(float win_w, float win_h, float rect[4]);

@@ -12,9 +12,7 @@
 #ifdef __ANDROID__
 #include <android/native_window.h>
 #endif
-#ifndef _WIN32
-#include <SDL3/SDL.h>  // message boxes (Linux, Android)
-#endif
+#include <SDL3/SDL.h>  // message boxes (Linux, Android), PNG files (texture packs)
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -41,6 +39,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <xxh3.h>
+#include <unordered_set>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -131,6 +131,97 @@ REXCVAR_DEFINE_BOOL(realsteel_native_dof, false, "Real Steel",
                     "Apply the game's depth-of-field blend in the native "
                     "renderer (off matches the xenos plugin's picture)");
 
+// Texture packs (2026-10-18). Every game texture has a name: the XXH3 of its
+// raw guest data and size (the same on every machine and every run).
+// realsteel_texture_export writes each texture the game uses as
+// texture_export/<name>.png (2D only; render targets and screen copies never
+// come through here); realsteel_texture_pack loads texture_pack/<name>.png
+// instead of the original whenever one exists - an upscaled copy, any size.
+REXCVAR_DEFINE_DOUBLE(realsteel_ambient_occlusion, 0.0, "Real Steel",
+                      "Ambient occlusion strength: soft shadowing in creases and "
+                      "under the robots (0 = off, the original picture)")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(realsteel_texture_pack, false, "Real Steel",
+                    "Use replacement textures from the texture_pack folder "
+                    "(files named like the exported ones)");
+REXCVAR_DEFINE_BOOL(realsteel_texture_export, false, "Real Steel",
+                    "Write every texture the game uses to the texture_export "
+                    "folder (for making a texture pack)");
+
+namespace realsteel::native_present {
+namespace {
+
+std::string TextureName(const std::vector<uint8_t>& raw, const rs::capture::DecodedTexture& tex) {
+  const uint64_t h = XXH3_64bits(raw.data(), raw.size());
+  char name[48];
+  std::snprintf(name, sizeof(name), "%016llx_%ux%u", static_cast<unsigned long long>(h), tex.width,
+                tex.height);
+  return name;
+}
+
+// The pack's file names, listed once (a lookup per new texture would hit
+// the disk; on Android /sdcard is slow).
+const std::unordered_set<std::string>& PackNames() {
+  // Built once, thread-safely: textures are decoded on several threads.
+  static const std::unordered_set<std::string> names = [] {
+    std::unordered_set<std::string> names;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("texture_pack", ec)) {
+      const std::filesystem::path p = e.path();
+      std::string ext = p.extension().string();
+      for (char& c : ext) c = char(std::tolower(uint8_t(c)));
+      if (ext == ".png") names.insert(p.stem().string());
+    }
+    REXLOG_INFO("[texture-pack] {} replacement texture(s) in texture_pack", names.size());
+    return names;
+  }();
+  return names;
+}
+
+bool LoadPackTexture(const std::string& name, rs::capture::DecodedTexture& out) {
+  const std::string path = "texture_pack/" + name + ".png";
+  SDL_Surface* loaded = SDL_LoadPNG(path.c_str());
+  if (loaded == nullptr) {
+    REXLOG_WARN("[texture-pack] {}: {}", path, SDL_GetError());
+    return false;
+  }
+  SDL_Surface* rgba = SDL_ConvertSurface(loaded, SDL_PIXELFORMAT_RGBA32);
+  SDL_DestroySurface(loaded);
+  if (rgba == nullptr) return false;
+  out.width = uint32_t(rgba->w);
+  out.height = uint32_t(rgba->h);
+  out.layers = 1;
+  out.rgba.resize(size_t(out.width) * out.height * 4);
+  for (uint32_t y = 0; y < out.height; ++y) {
+    std::memcpy(out.rgba.data() + size_t(y) * out.width * 4,
+                static_cast<const uint8_t*>(rgba->pixels) + size_t(y) * rgba->pitch, size_t(out.width) * 4);
+  }
+  SDL_DestroySurface(rgba);
+  return true;
+}
+
+void ExportTexture(const std::string& name, const rs::capture::DecodedTexture& tex) {
+  static std::mutex m;
+  static std::unordered_set<std::string> written;
+  {
+    std::lock_guard<std::mutex> lock(m);
+    if (!written.insert(name).second) return;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories("texture_export", ec);
+  const std::string path = "texture_export/" + name + ".png";
+  if (std::filesystem::exists(path, ec)) return;
+  SDL_Surface* s = SDL_CreateSurfaceFrom(int(tex.width), int(tex.height), SDL_PIXELFORMAT_RGBA32,
+                                         const_cast<uint8_t*>(tex.rgba.data()), int(tex.width * 4));
+  if (s == nullptr) return;
+  if (!SDL_SavePNG(s, path.c_str())) REXLOG_WARN("[texture-pack] {}: {}", path, SDL_GetError());
+  SDL_DestroySurface(s);
+}
+
+}  // namespace
+}  // namespace realsteel::native_present
+
 namespace realsteel::native_present {
 namespace {
 
@@ -150,8 +241,23 @@ class GuestTextureSource : public rs::vk::TextureSource {
     char label[32];
     std::snprintf(label, sizeof(label), "guest %08X", phys);
     const size_t raw_bytes = data.size();
+    const bool packs = REXCVAR_GET(realsteel_texture_pack) || REXCVAR_GET(realsteel_texture_export);
+    std::vector<uint8_t> raw;
+    if (packs) raw = data;
     const bool ok =
         rs::capture::DecodeGuestTexture(label, fetch, std::move(data), out);
+    // Frame-shaped textures (1280x720 and its halves) are pictures the game
+    // rendered and copied to memory, never artwork: replacing one with a
+    // bigger copy made the renderer take it for a screen copy (device lost).
+    const bool frame_shaped = out.width != 0 && out.width * 9 == out.height * 16 && 1280 % out.width == 0;
+    if (ok && packs && !frame_shaped && out.layers == 1 && out.width >= 4 && out.height >= 4) {
+      const std::string name = TextureName(raw, out);
+      if (REXCVAR_GET(realsteel_texture_export)) ExportTexture(name, out);
+      if (REXCVAR_GET(realsteel_texture_pack) && PackNames().count(name) != 0) {
+        rs::capture::DecodedTexture replacement;
+        if (LoadPackTexture(name, replacement)) out = std::move(replacement);
+      }
+    }
     // Diagnostics (rs_native_print.log): what the live path decoded. (The
     // RGBA checksum it also printed walked every pixel of every new texture -
     // removed 2026-10-15; the offline comparisons it served are done.)
@@ -270,6 +376,7 @@ std::atomic<void*> g_host_android_window{nullptr};
 // app came back - the old surface was gone). See AndroidWindowReady.
 std::atomic<bool> g_android_background{false};
 std::atomic<float> g_picture_aspect{0.0f};  // for the guest-side culling hook
+std::atomic<float> g_camera_fov{0.64f}, g_camera_near{1.0f}, g_camera_far{30000.0f};  // NoteCamera
 std::atomic<void* (*)()> g_android_window_source{nullptr};
 
 #ifdef __ANDROID__
@@ -519,6 +626,15 @@ void WorkerMain() {
     renderer->SetPrerotate(REXCVAR_GET(realsteel_native_prerotate));
     renderer->SetLowEnd(REXCVAR_GET(realsteel_native_crowd),
                         REXCVAR_GET(realsteel_native_texture_quality) == "half");
+    renderer->SetAmbientOcclusion(float(REXCVAR_GET(realsteel_ambient_occlusion)));
+    renderer->SetCamera(g_camera_fov.load(), g_camera_near.load(), g_camera_far.load());
+    {
+      static bool last_pack = REXCVAR_GET(realsteel_texture_pack);
+      if (REXCVAR_GET(realsteel_texture_pack) != last_pack) {
+        last_pack = REXCVAR_GET(realsteel_texture_pack);
+        renderer->ReloadTextures();
+      }
+    }
     renderer->SetVsync(WantVsync());
     renderer->SetQuality(
         AntiAliasing().msaa,
@@ -740,6 +856,12 @@ void BandRect(float win_w, float win_h, float rect[4]) {
 void SetHostWindowAndroid(void* native_window) { g_host_android_window.store(native_window); }
 void SetAndroidBackground(bool background) { g_android_background.store(background); }
 float CurrentPictureAspect() { return g_picture_aspect.load(); }
+
+void NoteCamera(float fov_y, float near_z, float far_z) {
+  g_camera_fov.store(fov_y);
+  g_camera_near.store(near_z);
+  g_camera_far.store(far_z);
+}
 void SetAndroidWindowSource(void* (*current_window)()) { g_android_window_source.store(current_window); }
 
 void SetHostWindowLinux(void* x11_display, unsigned long x11_window,

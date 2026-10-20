@@ -30,7 +30,7 @@ REXCVAR_DEFINE_DOUBLE(realsteel_touch_size, 1.0, "Real Steel",
 REXCVAR_DEFINE_DOUBLE(realsteel_touch_opacity, 1.0, "Real Steel",
                       "Touch controls opacity (0.2 - 1, 1 = original)");
 REXCVAR_DEFINE_STRING(realsteel_touch_layout, "", "Real Steel",
-                      "Arranged touch controls: name:dx,dy,size,shape,degrees;... "
+                      "Arranged touch controls: name:dx,dy,size,shape,degrees,RRGGBB,opacity;... "
                       "(offsets as fractions of the screen; set by Arrange touch controls)");
 
 namespace realsteel::touch {
@@ -68,6 +68,8 @@ struct Control {
   int shape = 0;              // 0 circle, 1 rounded square, 2 square, 3 kidney
   float scale = 1.0f;         // its group's size (labels follow)
   float angle = 0.0f;         // the shape's turn, radians clockwise
+  uint32_t colour = 0xFFFFFF; // its group's colour (RRGGBB; white = the original look)
+  int opacity = -1;           // its group's opacity in percent, -1 = the original look
 };
 
 // The kidney (the GameCube pad's X and Y): a band bent around a centre below
@@ -166,15 +168,21 @@ bool g_logged_visible = false;
 
 // Each group's layout (realsteel_touch_layout): offset as fractions of the
 // screen, size relative to the original, shape; and arrange mode's working
-// copy. Format: name:dx,dy[,scale[,shape[,degrees]]];...
+// copy. Format: name:dx,dy[,scale[,shape[,degrees[,RRGGBB[,opacity]]]]];...
 struct GroupLayout {
   float dx = 0.0f, dy = 0.0f, scale = 1.0f;
   int shape = 0;
-  int degrees = 0;  // the shapes' turn, clockwise
+  int degrees = 0;            // the shapes' turn, clockwise
+  uint32_t colour = 0xFFFFFF; // white = the original look
+  int opacity = -1;           // percent; -1 = the original (faint) look
   bool Moved() const {
-    return dx != 0.0f || dy != 0.0f || scale != 1.0f || shape != 0 || degrees != 0;
+    return dx != 0.0f || dy != 0.0f || scale != 1.0f || shape != 0 || degrees != 0 ||
+           colour != 0xFFFFFF || opacity != -1;
   }
 };
+// The colour swatches of arrange mode (2026-10-16): white first, the original.
+constexpr uint32_t kSwatches[10] = {0xFFFFFF, 0xE53935, 0xFB8C00, 0xFDD835, 0x43A047,
+                                    0x00ACC1, 0x1E88E5, 0x8E24AA, 0xEC407A, 0x303030};
 constexpr const char* kGroupTitles[kGroupCount] = {
     "STICK", "D-PAD", "LEFT LIGHT (X)", "RIGHT LIGHT (Y)", "LEFT HEAVY (A)", "RIGHT HEAVY (B)",
     "DODGE", "SWAY", "TECH", "BLOCK", "BACK", "START", "SETTINGS BUTTON"};
@@ -188,7 +196,10 @@ int g_selected = -1;  // arrange mode: the group the buttons change
 std::map<SDL_FingerID, std::pair<int, std::pair<float, float>>> g_drag;  // finger -> group, last pos
 // Arrange mode's buttons: x, y, w, h.
 float g_button_done[4] = {}, g_button_reset[4] = {};
-float g_button_smaller[4] = {}, g_button_bigger[4] = {}, g_button_shape[4] = {}, g_button_turn[4] = {};
+float g_button_smaller[4] = {}, g_button_bigger[4] = {}, g_button_shape[4] = {};
+float g_button_turn_left[4] = {}, g_button_turn_right[4] = {};
+float g_button_fainter[4] = {}, g_button_bolder[4] = {}, g_button_all[4] = {};
+float g_button_swatch[10][4] = {};
 
 void ParseLayout() {
   const std::string text = REXCVAR_GET(realsteel_touch_layout);
@@ -204,8 +215,10 @@ void ParseLayout() {
     const size_t colon = item.find(':');
     if (colon == std::string::npos) continue;
     float dx = 0, dy = 0, scale = 1.0f;
-    int shape = 0, degrees = 0;
-    if (std::sscanf(item.c_str() + colon + 1, "%f,%f,%f,%d,%d", &dx, &dy, &scale, &shape, &degrees) < 2) {
+    int shape = 0, degrees = 0, opacity = -1;
+    unsigned colour = 0xFFFFFF;
+    if (std::sscanf(item.c_str() + colon + 1, "%f,%f,%f,%d,%d,%x,%d", &dx, &dy, &scale, &shape, &degrees,
+                    &colour, &opacity) < 2) {
       continue;
     }
     const std::string name = item.substr(0, colon);
@@ -218,6 +231,8 @@ void ParseLayout() {
         g_layout[g].scale = std::max(0.5f, std::min(2.0f, scale));
         g_layout[g].shape = std::max(0, std::min(3, shape));
         g_layout[g].degrees = ((degrees % 360) + 360) % 360;
+        g_layout[g].colour = colour & 0xFFFFFF;
+        g_layout[g].opacity = opacity < 0 ? -1 : std::max(10, std::min(100, opacity));
       }
     }
   }
@@ -278,6 +293,8 @@ void Layout(float w, float h) {
     k.scale = l.scale;
     k.shape = c == kStick ? 0 : l.shape;  // the stick stays round
     k.angle = c == kStick ? 0.0f : float(l.degrees) * 3.14159265f / 180.0f;
+    k.colour = l.colour;
+    k.opacity = l.opacity;
     const float e = Extent(k);
     k.x = std::max(e, std::min(w - e, k.x));
     k.y = std::max(e, std::min(h - e, k.y));
@@ -314,14 +331,14 @@ void TickArrange(float w, float h) {
     if (found == g_drag.end()) {
       int group = -1;
       if (inside(g_button_done, t.x, t.y)) {
-        char text[768] = {};
+        char text[1280] = {};
         size_t used = 0;
         for (int g = 0; g < kGroupCount; ++g) {
           const GroupLayout& l = g_edit[g];
           if (!l.Moved()) continue;
-          used += size_t(std::snprintf(text + used, sizeof(text) - used, "%s%s:%.4f,%.4f,%.2f,%d,%d",
+          used += size_t(std::snprintf(text + used, sizeof(text) - used, "%s%s:%.4f,%.4f,%.2f,%d,%d,%06x,%d",
                                        used != 0 ? ";" : "", kGroupNames[g], l.dx, l.dy, l.scale,
-                                       l.shape, l.degrees));
+                                       l.shape, l.degrees, unsigned(l.colour), l.opacity));
           if (used >= sizeof(text)) break;
         }
         rex::cvar::SetFlagByName("realsteel_touch_layout", text);
@@ -341,8 +358,31 @@ void TickArrange(float w, float h) {
       } else if (g_selected >= 0 && g_selected != kGStick && inside(g_button_shape, t.x, t.y)) {
         g_edit[g_selected].shape = (g_edit[g_selected].shape + 1) % 4;
       } else if (g_selected >= 0 && g_selected != kGStick && g_edit[g_selected].shape != 0 &&
-                 inside(g_button_turn, t.x, t.y)) {
+                 inside(g_button_turn_left, t.x, t.y)) {
+        g_edit[g_selected].degrees = (g_edit[g_selected].degrees + 345) % 360;
+      } else if (g_selected >= 0 && g_selected != kGStick && g_edit[g_selected].shape != 0 &&
+                 inside(g_button_turn_right, t.x, t.y)) {
         g_edit[g_selected].degrees = (g_edit[g_selected].degrees + 15) % 360;
+      } else if (g_selected >= 0 && inside(g_button_fainter, t.x, t.y)) {
+        // original -> 100 -> ... -> 10 (fainter); bolder walks back up
+        int& o = g_edit[g_selected].opacity;
+        o = o < 0 ? 100 : std::max(10, o - 10);
+      } else if (g_selected >= 0 && inside(g_button_bolder, t.x, t.y)) {
+        int& o = g_edit[g_selected].opacity;
+        o = o < 0 ? 40 : std::min(100, o + 10);
+      } else if (g_selected >= 0 && inside(g_button_all, t.x, t.y)) {
+        for (GroupLayout& l : g_edit) {
+          l.colour = g_edit[g_selected].colour;
+          l.opacity = g_edit[g_selected].opacity;
+        }
+      } else if (g_selected >= 0 && [&] {
+                   for (int k = 0; k < 10; ++k)
+                     if (inside(g_button_swatch[k], t.x, t.y)) {
+                       g_edit[g_selected].colour = kSwatches[k];
+                       return true;
+                     }
+                   return false;
+                 }()) {
       } else {
         float best = 1e30f;
         for (int c = 0; c < kRoleCount; ++c) {
@@ -500,9 +540,9 @@ void Draw(ImDrawList* dl, ImFont* font, float width, float height) {
   const float op = arranging ? 1.0f
                              : std::max(0.2f, std::min(1.0f, float(REXCVAR_GET(realsteel_touch_opacity))));
   auto alpha = [op](int a) { return int(float(a) * op + 0.5f); };
-  const ImU32 fill = IM_COL32(255, 255, 255, alpha(38)), fill_on = IM_COL32(90, 220, 225, alpha(110));
-  const ImU32 edge_all = arranging ? IM_COL32(90, 220, 225, 230) : IM_COL32(255, 255, 255, alpha(120));
-  const ImU32 text = IM_COL32(255, 255, 255, alpha(200));
+  const ImU32 fill_on = IM_COL32(90, 220, 225, alpha(110));
+  const ImU32 edge_all = IM_COL32(90, 220, 225, 230);   // arrange mode's outline
+  const ImU32 text_all = IM_COL32(255, 255, 255, alpha(200));
   {
     const Control& up = g_controls[kPadUp];
     const Control& down = g_controls[kPadDown];
@@ -518,12 +558,29 @@ void Draw(ImDrawList* dl, ImFont* font, float width, float height) {
     const Control& k = g_controls[c];
     if (k.r <= 0.0f) continue;
     const float s = s_all * k.scale;  // labels follow the group's size
-    const ImU32 edge = arranging && kRoleGroup[c] == g_selected ? IM_COL32(255, 210, 90, 255) : edge_all;
+    // The button's own colour and opacity (arrange mode); white at the
+    // original opacity is the original look.
+    const int cr = int(k.colour >> 16) & 255, cg = int(k.colour >> 8) & 255, cb = int(k.colour) & 255;
+    ImU32 fill = IM_COL32(cr, cg, cb, alpha(38)), edge_own = IM_COL32(cr, cg, cb, alpha(120)), text = text_all;
+    if (k.opacity >= 0) {
+      const float o = float(k.opacity) / 100.0f;
+      fill = IM_COL32(cr, cg, cb, int(220.0f * o));
+      edge_own = IM_COL32(std::min(255, cr + 40), std::min(255, cg + 40), std::min(255, cb + 40),
+                          int(255.0f * std::min(1.0f, o + 0.35f)));
+      // dark lettering on a light, solid button, white otherwise
+      const bool light = (cr * 299 + cg * 587 + cb * 114) / 1000 > 160 && o >= 0.55f;
+      text = light ? IM_COL32(20, 24, 28, 255) : IM_COL32(255, 255, 255, 255);
+    }
+    if (arranging) edge_own = edge_all;
+    const ImU32 edge = arranging && kRoleGroup[c] == g_selected ? IM_COL32(255, 210, 90, 255) : edge_own;
     if (c == kStick) {
       dl->AddCircleFilled(ImVec2(k.x, k.y), k.r, fill, 48);
       dl->AddCircle(ImVec2(k.x, k.y), k.r, edge, 48, 2.0f * s);
       const ImVec2 knob(k.x + g_stick_x * k.r * 0.6f, k.y + g_stick_y * k.r * 0.6f);
-      dl->AddCircleFilled(knob, k.r * 0.42f, g_pressed[kStick] ? fill_on : IM_COL32(255, 255, 255, 70), 40);
+      dl->AddCircleFilled(knob, k.r * 0.42f,
+                          g_pressed[kStick] ? fill_on
+                          : k.opacity >= 0 ? IM_COL32(cr, cg, cb, int(255.0f * std::min(1.0f, k.opacity / 100.0f + 0.2f)))
+                                           : IM_COL32(cr, cg, cb, 70), 40);
       continue;
     }
     if (k.shape == 0) {
@@ -583,10 +640,25 @@ void Draw(ImDrawList* dl, ImFont* font, float width, float height) {
     const char* line = "Drag a control to move it, tap one to change it";
     const float size = 26.0f * ui;
     const ImVec2 ts = font->CalcTextSizeA(size, 1e9f, 0.0f, line);
-    const float cy = height * 0.42f;
-    dl->AddRectFilled(ImVec2(width * 0.5f - ts.x * 0.5f - 24 * ui, cy - 20 * ui),
-                      ImVec2(width * 0.5f + ts.x * 0.5f + 24 * ui, cy + ts.y + 186 * ui),
-                      IM_COL32(12, 16, 20, 220), 12 * ui);
+    // The panel sits in the half of the screen away from the control being
+    // changed, so that control stays in view.
+    const float panel_h = ts.y + 28 * ui + 4 * 56 * ui + 3 * 14 * ui + 64 * ui;
+    float cy = height * 0.24f;
+    if (g_selected >= 0) {
+      float sy = 0.0f;
+      int n = 0;
+      for (int c = 0; c < kRoleCount; ++c)
+        if (kRoleGroup[c] == g_selected) {
+          sy += g_controls[c].y;
+          ++n;
+        }
+      sy /= float(std::max(1, n));
+      cy = sy > height * 0.5f ? 28 * ui : height - panel_h - 8 * ui + 20 * ui;
+    }
+    const float panel_w = std::max(ts.x + 48 * ui, 5 * 110 * ui + 4 * 12 * ui + 48 * ui);
+    dl->AddRectFilled(ImVec2(width * 0.5f - panel_w * 0.5f, cy - 20 * ui),
+                      ImVec2(width * 0.5f + panel_w * 0.5f, cy + ts.y + 28 * ui + 4 * 56 * ui + 3 * 14 * ui + 44 * ui),
+                      IM_COL32(12, 16, 20, 225), 12 * ui);
     dl->AddText(font, size, ImVec2(width * 0.5f - ts.x * 0.5f, cy), IM_COL32(255, 255, 255, 240), line);
     const float bw = 150 * ui, bh = 56 * ui, by = cy + ts.y + 28 * ui;
     const float done[4] = {width * 0.5f + 10 * ui, by, bw, bh};
@@ -601,28 +673,63 @@ void Draw(ImDrawList* dl, ImFont* font, float width, float height) {
     };
     button(reset, "RESET", IM_COL32(60, 70, 78, 240));
     button(done, "DONE", IM_COL32(28, 127, 138, 240));
-    // Second row: the selected group's size and shape.
-    const float sw = 110 * ui, row2 = by + bh + 14 * ui, x0 = width * 0.5f - sw * 2.0f - 18 * ui;
-    const float smaller[4] = {x0, row2, sw, bh};
-    const float bigger[4] = {x0 + sw + 12 * ui, row2, sw, bh};
-    const float shape[4] = {x0 + (sw + 12 * ui) * 2.0f, row2, sw, bh};
-    const float turn[4] = {x0 + (sw + 12 * ui) * 3.0f, row2, sw, bh};
-    std::memcpy(g_button_smaller, smaller, sizeof(smaller));
-    std::memcpy(g_button_bigger, bigger, sizeof(bigger));
-    std::memcpy(g_button_shape, shape, sizeof(shape));
-    std::memcpy(g_button_turn, turn, sizeof(turn));
+    // Rows for the selected group: size, shape and turn; colour; opacity.
+    const float sw = 110 * ui, gap = 12 * ui, x0 = width * 0.5f - (sw * 5 + gap * 4) * 0.5f;
+    const float row2 = by + bh + 14 * ui, row3 = row2 + bh + 14 * ui, row4 = row3 + bh + 14 * ui;
+    auto cell = [&](float* out, int col, float row) {
+      const float b[4] = {x0 + (sw + gap) * col, row, sw, bh};
+      std::memcpy(out, b, sizeof(b));
+    };
+    cell(g_button_smaller, 0, row2);
+    cell(g_button_bigger, 1, row2);
+    cell(g_button_shape, 2, row2);
+    cell(g_button_turn_left, 3, row2);
+    cell(g_button_turn_right, 4, row2);
+    const float row_w = sw * 5 + gap * 4, swg = 8 * ui, sws = (row_w - swg * 9) / 10;
+    for (int k = 0; k < 10; ++k) {
+      const float b[4] = {x0 + (sws + swg) * k, row3, sws, bh};
+      std::memcpy(g_button_swatch[k], b, sizeof(b));
+    }
+    cell(g_button_fainter, 0, row4);
+    cell(g_button_bolder, 4, row4);
+    const float all[4] = {x0 + (sw + gap) * 3, row4, sw, bh};
+    std::memcpy(g_button_all, all, sizeof(all));
     if (g_selected >= 0) {
-      button(smaller, "SMALLER", IM_COL32(60, 70, 78, 240));
-      button(bigger, "BIGGER", IM_COL32(60, 70, 78, 240));
+      const GroupLayout& sel = g_edit[g_selected];
+      button(g_button_smaller, "SMALLER", IM_COL32(60, 70, 78, 240));
+      button(g_button_bigger, "BIGGER", IM_COL32(60, 70, 78, 240));
       if (g_selected != kGStick) {
-        button(shape, kShapeNames[(g_edit[g_selected].shape + 1) % 4], IM_COL32(60, 70, 78, 240));
-        if (g_edit[g_selected].shape != 0) button(turn, "ROTATE", IM_COL32(60, 70, 78, 240));
+        button(g_button_shape, kShapeNames[(sel.shape + 1) % 4], IM_COL32(60, 70, 78, 240));
+        if (sel.shape != 0) {
+          button(g_button_turn_left, "< TURN", IM_COL32(60, 70, 78, 240));
+          button(g_button_turn_right, "TURN >", IM_COL32(60, 70, 78, 240));
+        }
       }
+      for (int k = 0; k < 10; ++k) {
+        const float* b = g_button_swatch[k];
+        const uint32_t c = kSwatches[k];
+        dl->AddRectFilled(ImVec2(b[0], b[1]), ImVec2(b[0] + b[2], b[1] + b[3]),
+                          IM_COL32((c >> 16) & 255, (c >> 8) & 255, c & 255, 255), 8 * ui);
+        if (sel.colour == c) {
+          dl->AddRect(ImVec2(b[0] - 3 * ui, b[1] - 3 * ui), ImVec2(b[0] + b[2] + 3 * ui, b[1] + b[3] + 3 * ui),
+                      IM_COL32(255, 210, 90, 255), 9 * ui, 0, 3 * ui);
+        }
+      }
+      button(g_button_fainter, "FAINTER", IM_COL32(60, 70, 78, 240));
+      button(g_button_bolder, "BOLDER", IM_COL32(60, 70, 78, 240));
+      button(g_button_all, "TO ALL", IM_COL32(28, 100, 110, 240));
+      char amount[32];
+      if (sel.opacity < 0) std::snprintf(amount, sizeof(amount), "Opacity: original");
+      else std::snprintf(amount, sizeof(amount), "Opacity: %d%%", sel.opacity);
+      const ImVec2 as = font->CalcTextSizeA(20 * ui, 1e9f, 0.0f, amount);
+      const float mid = x0 + (sw + gap) * 1 + (sw * 2 + gap) * 0.5f;
+      dl->AddText(font, 20 * ui, ImVec2(mid - as.x * 0.5f, row4 + (bh - as.y) * 0.5f), IM_COL32(230, 235, 240, 255),
+                  amount);
       const ImVec2 ns = font->CalcTextSizeA(18 * ui, 1e9f, 0.0f, kGroupTitles[g_selected]);
-      dl->AddText(font, 18 * ui, ImVec2(width * 0.5f - ns.x * 0.5f, row2 + bh + 6 * ui),
+      dl->AddText(font, 18 * ui, ImVec2(width * 0.5f - ns.x * 0.5f, row4 + bh + 8 * ui),
                   IM_COL32(255, 210, 90, 255), kGroupTitles[g_selected]);
     } else {
-      const char* hint = "Tap a control to change its size, shape or angle";
+      const char* hint = "Tap a control to change its size, shape, angle or colour";
       const ImVec2 hs = font->CalcTextSizeA(18 * ui, 1e9f, 0.0f, hint);
       dl->AddText(font, 18 * ui, ImVec2(width * 0.5f - hs.x * 0.5f, row2 + bh * 0.3f),
                   IM_COL32(200, 210, 215, 220), hint);

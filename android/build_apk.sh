@@ -73,12 +73,16 @@ done
 # The crash catcher, loaded before everything else (android/native/rscrash.c).
 "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --target=aarch64-linux-android30     -shared -fPIC -O2 -funwind-tables -Wl,-z,max-page-size=16384     -o "$WORK/pkg/lib/arm64-v8a/librscrash.so" "$SCRIPT_DIR/native/rscrash.c" -llog
 # The installer: the PC setup programs' code (tools/setup) behind a JNI bridge
-# (android/native/setup_jni.cpp), for the launcher's "Install game files".
+# (android/native/setup_jni.cpp), for the launcher's "Install game files", and
+# the optional fighter import from another Yuke's game (tools/primport).
 "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --target=aarch64-linux-android30 \
     -std=c++20 -shared -fPIC -O2 -static-libstdc++ -Wl,-z,max-page-size=16384 \
     -ffile-prefix-map="$SRC"=. -ffile-prefix-map="$HOME"=~ \
     -o "$WORK/pkg/lib/arm64-v8a/librssetup.so" \
-    "$SRC/tools/setup/stfs.cpp" "$SRC/tools/setup/install.cpp" "$SCRIPT_DIR/native/setup_jni.cpp" -llog
+    "$SRC/tools/setup/stfs.cpp" "$SRC/tools/setup/install.cpp" "$SCRIPT_DIR/native/setup_jni.cpp" \
+    "$SRC/tools/primport/primport_core.cpp" "$SRC/tools/primport/primport_model.cpp" \
+    "$SRC/tools/primport/primport_icons.cpp" "$SRC/tools/primport/primport_motion.cpp" \
+    "$SRC/tools/primport/primport.cpp" -llog
 "$STRIP" --strip-debug "$WORK/pkg/lib/arm64-v8a/librssetup.so"
 cp "$WORK/dex/classes.dex" "$WORK/pkg/"
 # Our licence and the third-party notices the libraries need, as on the PC.

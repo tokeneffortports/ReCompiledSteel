@@ -6,7 +6,13 @@ project(realsteel_setup LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(RS_SETUP_SOURCES stfs.cpp install.cpp setup_common.cpp)
+set(RS_SETUP_SOURCES stfs.cpp install.cpp setup_common.cpp
+    # optional fighter import from another Yuke's game (tools/primport)
+    ${CMAKE_CURRENT_LIST_DIR}/../primport/primport_core.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../primport/primport_model.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../primport/primport_icons.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../primport/primport_motion.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../primport/primport.cpp)
 if(WIN32)
     add_executable(realsteel_setup WIN32 ${RS_SETUP_SOURCES} setup_win.cpp)
     set_target_properties(realsteel_setup PROPERTIES OUTPUT_NAME "RealSteelSetup")

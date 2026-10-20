@@ -1,10 +1,12 @@
 #include "realsteel_overlay.h"
+#include "realsteel_framerate.h"
 
 #include "realsteel_keyboard.h"
 #include "realsteel_mods_pack.h"
 #include "realsteel_icon.h"
 #include "realsteel_native_present.h"
 #include "realsteel_netplay.h"
+#include "realsteel_robots.h"
 #include "realsteel_online.h"
 #include "realsteel_touch.h"
 #include "realsteel_version.h"
@@ -57,6 +59,8 @@
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app_context.h>
 
+REXCVAR_DEFINE_BOOL(realsteel_robot_lab, false, "Real Steel",
+                    "Development: the Debug tab (robot lab: live stats of full robots)");
 REXCVAR_DEFINE_BOOL(realsteel_mute_background, true, "Real Steel",
                     "Mute the game while its window is not focused");
 REXCVAR_DEFINE_BOOL(realsteel_show_memory, false, "Real Steel",
@@ -76,6 +80,7 @@ namespace realsteel::overlay {
 namespace {
 
 constexpr const char* kSettingsFile = "realsteel_settings.cfg";
+constexpr const char* kLabTab = "Debug";
 
 // ---------------------------------------------------------------------------
 // The settings table. One row per setting; the page, the defaults button and
@@ -101,6 +106,18 @@ struct Setting {
   void (*on_change)() = nullptr;    // UI thread, after the cvar was set
   std::string (*info)() = nullptr;  // kInfo: the text to show
 };
+
+// The choices offered now: Frame rate only lists the rates the display can
+// show (all of them while it is not known, e.g. headless tests).
+std::vector<Choice> ChoicesOf(const Setting& s) {
+  if (s.cvar == nullptr || std::strcmp(s.cvar, "realsteel_frame_rate") != 0) return s.choices;
+  const int hz = realsteel::framerate::DisplayRefreshHz();
+  if (hz <= 0) return s.choices;
+  std::vector<Choice> kept;
+  for (const Choice& c : s.choices)
+    if (std::atoi(c.value) <= hz + 1) kept.push_back(c);
+  return kept;
+}
 
 void ApplyFullscreen();
 void RequestQuit();
@@ -148,6 +165,11 @@ const std::vector<Setting>& Settings() {
        "Off shows each frame as soon as it is ready; on waits for the "
        "display. Automatic: off on Steam Deck / Linux, on under Windows.",
        {{"Automatic", "auto"}, {"On", "on"}, {"Off", "off"}}},
+      {"Display", "Frame rate", "realsteel_frame_rate", Kind::kChoice, "60",
+       "Frames per second; the game keeps its normal speed in each. Online "
+       "matches always run at 60. 90 and 120 are offered when the display "
+       "refreshes that fast.",
+       {{"30", "30"}, {"60", "60"}, {"90", "90"}, {"120", "120"}}},
       {"Display", "Gamma", "realsteel_native_gamma", Kind::kSlider, "1.28",
        "Lower is brighter. 1.28 is the original look.", {}, 0.80f, 1.80f},
       {"Display", "Sharpening", "realsteel_native_sharpen", Kind::kSlider, "0",
@@ -287,14 +309,24 @@ const std::vector<Setting>& Settings() {
        "The game ships in English and Japanese. Restart the game after "
        "changing this.",
        {{"English", "1"}, {"Japanese", "2"}}},
+      // ------------------------------------------------------- Enhancements
+      // Improvements over the original picture; all off by default.
+      // (realsteel_ambient_occlusion is not listed yet: it flickered in camera
+      // moves and cost ~18 fps on a handheld for little visible gain.)
+      {"Enhancements", "Texture pack", "realsteel_texture_pack", Kind::kToggle, "false",
+       "Use replacement textures (for example upscaled ones) from the "
+       "texture_pack folder. Files are named like the exported ones."},
+      {"Enhancements", "Export textures", "realsteel_texture_export", Kind::kToggle, "false",
+       "Writes every texture the game shows to the texture_export folder as "
+       "PNG, ready to upscale into a texture pack. Play through the screens "
+       "you want covered, then switch it off."},
       // ------------------------------------------------------------- Cheats
       {"Cheats", "Cash", "", Kind::kAction, "+ R100,000",
        "Adds R100,000 to your cash. The amount shows in the garage and is saved "
        "with your game data.", {}, 0, 1, &AddCash},
       {"Cheats", "Game speed", "realsteel_guest_fps_cap", Kind::kChoice, "60",
-       "The game runs at this fraction of normal speed (it follows the frame "
-       "rate: 60 fps is normal). Slow motion for knockouts, fast forward for "
-       "careers.",
+       "The game runs at this fraction of normal speed, at any frame rate. "
+       "Slow motion for knockouts, fast forward for careers.",
        {{"50% (slow motion)", "30"}, {"75%", "45"}, {"100% (normal)", "60"},
         {"150%", "90"}, {"200%", "120"}, {"Unlimited", "0"}}},
   };
@@ -318,9 +350,92 @@ const std::vector<const char*>& Sections() {
       for (const char* name : out) seen = seen || std::strcmp(name, s.section) == 0;
       if (!seen) out.push_back(s.section);
     }
+    // the robot lab (development: live stats of full robots)
+    if (REXCVAR_GET(realsteel_robot_lab)) out.push_back(kLabTab);
     return out;
   }();
   return sections;
+}
+
+// ---------------------------------------------------------------------------
+// Debug tab: the robot lab (realsteel_robots.h). Per full robot, its
+// robot-wide figures (Core HP, attack, defense, speeds ...) with a box to set
+// each; the game uses the new values the next time it works the robot out
+// (move the select screen off the robot and back, or start a fight).
+// ---------------------------------------------------------------------------
+int g_lab_robot = -1;
+std::string g_lab_saved;
+
+void DrawRobotLab(float ui) {
+  const std::vector<realsteel::robots::LabRobot> robots = realsteel::robots::LabRobots();
+  if (robots.empty()) {
+    ImGui::TextWrapped("No full robots installed (robot folders with kind = full).");
+    return;
+  }
+  const realsteel::robots::LabRobot* r = &robots.front();
+  for (const auto& x : robots)
+    if (x.index == g_lab_robot) r = &x;
+  g_lab_robot = r->index;
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Robot");
+  ImGui::SameLine(120.0f * ui);
+  ImGui::SetNextItemWidth(260.0f * ui);
+  if (ImGui::BeginCombo("##labrobot", r->name.c_str())) {
+    for (const auto& x : robots)
+      if (ImGui::Selectable(x.name.c_str(), x.index == r->index)) g_lab_robot = x.index;
+    ImGui::EndCombo();
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Save config")) g_lab_saved = realsteel::robots::LabSave(r->index);
+  ImGui::SameLine();
+  if (ImGui::Button("Reset all")) realsteel::robots::LabReset(r->index);
+  if (!g_lab_saved.empty()) ImGui::TextColored(ImVec4(0.6f, 0.85f, 0.6f, 1.0f), "Saved: %s (next to the game)", g_lab_saved.c_str());
+  if (r->game.empty()) {
+    ImGui::TextWrapped("Show this robot on the select screen (or fight with it) to load its figures.");
+    return;
+  }
+  ImGui::TextDisabled("Changes apply the next time the game works the robot out: move off it and back on the select screen, or start a fight.");
+  ImGui::Spacing();
+  ImGui::TextDisabled("Figure");
+  ImGui::SameLine(230.0f * ui);
+  ImGui::TextDisabled("Game");
+  ImGui::SameLine(310.0f * ui);
+  ImGui::TextDisabled("Set");
+  for (const auto& f : realsteel::robots::LabFeels()) {
+    ImGui::PushID(f.stat);
+    const auto g = r->game.find(f.stat);
+    const int game = g == r->game.end() ? 0 : int(std::lround(g->second));
+    const auto v = r->feel.find(f.stat);
+    const bool set = v != r->feel.end();
+    int value = set ? v->second : game;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(f.label);
+    ImGui::SameLine(230.0f * ui);
+    ImGui::TextDisabled("%d", game);
+    ImGui::SameLine(310.0f * ui);
+    ImGui::SetNextItemWidth(170.0f * ui);
+    if (set) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.30f, 0.22f, 0.08f, 1.0f));
+    if (ImGui::InputInt("##v", &value, 1, f.is_float ? 100 : 2)) realsteel::robots::LabSet(r->index, f.stat, value);
+    if (set) ImGui::PopStyleColor();
+    if (set) {
+      ImGui::SameLine();
+      if (ImGui::SmallButton("game")) realsteel::robots::LabClear(r->index, f.stat);
+    }
+    ImGui::PopID();
+  }
+  if (!r->totals.empty()) {
+    std::string line;
+    for (const auto& [stat, value] : r->totals) {
+      char b[64];
+      std::snprintf(b, sizeof(b), "%s%s %.0f", line.empty() ? "" : ",  ", realsteel::robots::LabFigureName(stat), value);
+      line += b;
+    }
+    ImGui::Spacing();
+    ImGui::TextDisabled("As the game last showed it:");
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 0.95f, 1.0f));
+    ImGui::TextWrapped("%s", line.c_str());
+    ImGui::PopStyleColor();
+  }
 }
 
 bool AsBool(const std::string& v) { return v == "true" || v == "1"; }
@@ -631,6 +746,11 @@ class SettingsPage : public rex::ui::ImGuiDialog {
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
     if (first_frame_) ImGui::SetNextWindowFocus();
+    // With the robot lab on (a development switch) the page opens on it.
+    if (first_frame_ && REXCVAR_GET(realsteel_robot_lab)) {
+      for (int i = 0; i < int(tab_names.size()); ++i)
+        if (std::strcmp(tab_names[i], kLabTab) == 0) tab_ = i;
+    }
     if (ImGui::Begin("##realsteel_settings", nullptr,
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -688,8 +808,13 @@ class SettingsPage : public rex::ui::ImGuiDialog {
       ImGui::BeginChild("##rows", ImVec2(0.0f, ImGui::GetFrameHeightWithSpacing() * visible_rows + 4.0f * ui),
                         ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
       g_slider_active = false;
+      const bool lab_tab = std::strcmp(sections[tab_], kLabTab) == 0;
+      if (lab_tab) {
+        DrawRobotLab(ui);
+        rows = visible_rows;
+      }
       for (const Setting& s : Settings()) {
-        if (std::strcmp(s.section, sections[tab_]) != 0) continue;
+        if (lab_tab || std::strcmp(s.section, sections[tab_]) != 0) continue;
         ++rows;
         ImGui::PushID(s.cvar[0] != 0 ? s.cvar : s.label);
         ImGui::AlignTextToFramePadding();
@@ -709,11 +834,12 @@ class SettingsPage : public rex::ui::ImGuiDialog {
           }
           case Kind::kChoice: {
             const char* preview = current.c_str();
-            for (const Choice& c : s.choices) {
+            const std::vector<Choice> choices = ChoicesOf(s);
+            for (const Choice& c : choices) {
               if (SameValue(current, c.value)) preview = c.label;
             }
             if (ImGui::BeginCombo("##v", preview)) {
-              for (const Choice& c : s.choices) {
+              for (const Choice& c : choices) {
                 const bool selected = SameValue(current, c.value);
                 if (ImGui::Selectable(c.label, selected) && !selected) {
                   SetValue(s, c.value);
@@ -1586,9 +1712,15 @@ void LoadSavedSettings() {
 void LoadSettingsFile() {
   FILE* f = std::fopen(kSettingsFile, "r");
   if (f == nullptr) return;
-  char line[256];
-  while (std::fgets(line, sizeof(line), f) != nullptr) {
-    std::string text(line);
+  // Whole lines of any length (2026-10-16: a 256-byte buffer cut long
+  // touch layouts short, and the next save kept them short).
+  char chunk[512];
+  std::string pending;
+  while (std::fgets(chunk, sizeof(chunk), f) != nullptr) {
+    pending += chunk;
+    if (pending.back() != '\n' && !std::feof(f)) continue;  // the rest of a long line follows
+    std::string text;
+    text.swap(pending);
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r' ||
                              text.back() == ' ')) {
       text.pop_back();
@@ -1975,12 +2107,13 @@ RowView Row(int page, int row) {
       view.value = view.index ? "ON" : "OFF";
       break;
     case Kind::kChoice: {
-      view.count = uint32_t(s->choices.size());
+      const std::vector<Choice> choices = ChoicesOf(*s);
+      view.count = uint32_t(choices.size());
       view.value = Upper(current);
-      for (size_t i = 0; i < s->choices.size(); ++i) {
-        if (SameValue(current, s->choices[i].value)) {
+      for (size_t i = 0; i < choices.size(); ++i) {
+        if (SameValue(current, choices[i].value)) {
           view.index = uint32_t(i);
-          view.value = ShortChoice(s->choices[i].label);
+          view.value = ShortChoice(choices[i].label);
         }
       }
       break;
@@ -2043,7 +2176,10 @@ void Change(int page, int row, uint32_t index) {
       SetValue(*s, index ? "true" : "false");
       break;
     case Kind::kChoice:
-      if (index < s->choices.size()) SetValue(*s, s->choices[index].value);
+    {
+      const std::vector<Choice> choices = ChoicesOf(*s);
+      if (index < choices.size()) SetValue(*s, choices[index].value);
+    }
       break;
     case Kind::kSlider: {
       const float v = std::min(s->slider_max, s->slider_min + float(index) * SliderStep(*s));

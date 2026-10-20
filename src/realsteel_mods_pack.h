@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rex/rex_app.h>
@@ -24,5 +26,31 @@ void Install(rex::PathConfig& paths);
 
 // Robots that were not loaded and why, for the player (empty: all fine).
 std::vector<std::string> Notices();
+
+// Robot indices of the installed full robots (kind = full), for the robot
+// database hook to enable (realsteel_robots.cpp).
+std::vector<int> FullRobotIndices();
+
+// True for a full robot that stays out of character select (robot.txt
+// select = 0: e.g. a boosted copy that only fights in a single-player stage).
+bool FullRobotHidden(int robot_index);
+
+// A full robot's own part ids (slots 1..10 in ids[1..10]); false if the
+// robot index is not a full robot's.
+bool FullRobotParts(int robot_index, uint32_t ids[11]);
+
+// The installed full robots: (robot index, name).
+std::vector<std::pair<int, std::string>> FullRobots();
+
+// A full robot's folder (its robot.txt is there); empty if not a full robot.
+std::string FullRobotFolder(int robot_index);
+
+// The full robots' motions (one bank, one event bank; empty if none), for
+// the robots hook to install as motion slot 2.
+const std::vector<uint8_t>& FullRobotMotions();
+const std::vector<uint8_t>& FullRobotMotionEvents();
+// A full robot's own motion for a move (act): true and its act in the robots'
+// bank, or false (the move's own motion).
+bool FullRobotMotionAct(int robot_index, uint32_t act, uint32_t* own);
 
 }  // namespace realsteel::mods

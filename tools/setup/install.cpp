@@ -220,8 +220,7 @@ bool Run(const Plan& plan, const Log& log, const Progress& progress, std::string
   // and the original default.xex alone does not start (2026-10-13).
   if (plan.update.empty()) {
     return Fail(error, "The title update package is missing. ReCompiled Steel needs it: the game is "
-                       "built for the updated version. On the console it is under "
-                       "Content/0000000000000000/584111E0/000B0000/.");
+                       "built for the updated version. Copy it from your Xbox 360 too.");
   }
   {
     if (!update.Open(plan.update, error)) return false;

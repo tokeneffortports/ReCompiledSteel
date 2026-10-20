@@ -43,16 +43,9 @@ need `generated/rexglue.cmake` regenerated with `rexglue init`.
 
 ## 3. Your game files
 
-Copy the Real Steel packages from your Xbox 360 to the PC (FTP from a console
-running Aurora or FSD, or a PC tool that reads Xbox 360 storage such as Party
-Buffalo, Xplorer360 or USBXTAFGUI; they are under
-`Content\0000000000000000\584111E0\`):
-
-| Folder on the console | What | Needed |
-| --- | --- | --- |
-| `000D0000\<40 hex characters>` (about 200 MB) | the game | yes |
-| `000B0000\<40 hex characters>` (about 6 MB) | the title update | yes |
-| `00000002\<40 hex characters>` (18 files) | the add-ons | only to play them |
+Copy your own Real Steel packages from your Xbox 360 to the PC: the game
+(about 200 MB) and its title update (about 6 MB) are needed; the add-ons only
+to play them.
 
 Then lay them out in `work/`:
 

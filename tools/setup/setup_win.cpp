@@ -3,6 +3,8 @@
 // options of setup_common.h.
 #include "setup_common.h"
 
+#include "../primport/primport.h"
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -41,7 +43,7 @@ std::string Narrow(const std::wstring& wide) {
 
 enum Id {
   kGameEdit = 101, kGameBrowse, kUpdateEdit, kUpdateBrowse, kAddonsEdit, kAddonsBrowse,
-  kScanButton, kInstallButton, kCloseButton, kProgress, kStatus, kLog
+  kScanButton, kInstallButton, kCloseButton, kProgress, kStatus, kLog, kFightersButton
 };
 constexpr UINT kMsgProgress = WM_APP + 1;  // wParam = percent, lParam = std::wstring* (owned)
 constexpr UINT kMsgLog = WM_APP + 2;       // lParam = std::wstring* (owned)
@@ -50,10 +52,11 @@ constexpr UINT kMsgDone = WM_APP + 3;      // wParam = ok, lParam = std::wstring
 struct Window {
   HWND hwnd = nullptr;
   HWND game = nullptr, update = nullptr, addons = nullptr, install = nullptr, progress = nullptr,
-       status = nullptr, log = nullptr, scan = nullptr, close = nullptr;
+       status = nullptr, log = nullptr, scan = nullptr, close = nullptr, fighters = nullptr;
   HWND browse[3] = {};
   HFONT font = nullptr;
   bool busy = false;
+  bool importing = false;   // the running job imports fighters (not the game files)
   Args args;
   std::thread worker;
 };
@@ -105,7 +108,7 @@ void AppendLog(Window& w, const std::wstring& line) {
 
 void SetBusy(Window& w, bool busy) {
   w.busy = busy;
-  for (HWND h : {w.game, w.update, w.addons, w.install, w.scan, w.browse[0], w.browse[1], w.browse[2]}) {
+  for (HWND h : {w.game, w.update, w.addons, w.install, w.scan, w.fighters, w.browse[0], w.browse[1], w.browse[2]}) {
     EnableWindow(h, !busy);
   }
   SetWindowTextW(w.close, busy ? L"Cancel" : L"Close");
@@ -146,6 +149,61 @@ void StartInstall(Window& w) {
   });
 }
 
+// Optional: the robot fighters of another Yuke's Xbox 360 game (the player's
+// own packages) into the player's data, built on the installed Real Steel.
+void StartImport(Window& w) {
+  const fs::path dest = w.args.dest.empty() ? ProgramDir() : w.args.dest;
+  const fs::path game = dest / "game";
+  if (!fs::is_regular_file(game / "pac" / "ch" / "ch100.pac")) {
+    MessageBoxW(w.hwnd, L"Install Real Steel first: the fighters are built on its game files.", L"ReCompiled Steel setup",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  const std::wstring folder =
+      PickPath(w.hwnd, L"Folder with the packages of another Yuke's Xbox 360 game (your own copy, e.g. its Content folder)", true);
+  if (folder.empty()) return;
+  SetWindowTextW(w.status, L"Looking through the folder...");
+  UpdateWindow(w.status);
+  const rs::primport::Found found = rs::primport::Scan(fs::path(folder));
+  if (found.game.empty()) {
+    SetWindowTextW(w.status, L"");
+    MessageBoxW(w.hwnd,
+                L"No supported game in that folder.\n\nPick the folder holding the game's Xbox 360 packages, as copied "
+                L"from your console (its add-ons too, if you have them). Supported so far: Pacific Rim.",
+                L"ReCompiled Steel setup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring names;
+  for (const std::string& n : found.fighters) names += L"\n  " + Wide(n);
+  const std::wstring question = L"Found " + Wide(found.game) + L" with " + std::to_wstring(found.fighters.size()) +
+                                L" fighter(s):" + names + L"\n\nImport them? They appear in character select.";
+  if (MessageBoxW(w.hwnd, question.c_str(), L"ReCompiled Steel setup", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+    SetWindowTextW(w.status, L"");
+    return;
+  }
+  const fs::path out = rs::primport::ImportDir(w.args.user_root.empty() ? DefaultUserRoot() : w.args.user_root);
+  w.importing = true;
+  SetBusy(w, true);
+  SetWindowTextW(w.log, L"");
+  SendMessageW(w.progress, PBM_SETPOS, 0, 0);
+  HWND hwnd = w.hwnd;
+  if (w.worker.joinable()) w.worker.join();
+  const fs::path from(folder);
+  w.worker = std::thread([hwnd, from, game, out] {
+    std::string error;
+    const bool ok = rs::primport::Import(
+        from, game, out,
+        [hwnd](const std::string& line) {
+          PostMessageW(hwnd, kMsgLog, 0, reinterpret_cast<LPARAM>(new std::wstring(Wide(line))));
+        },
+        [hwnd](double fraction, const std::string& what) {
+          PostMessageW(hwnd, kMsgProgress, WPARAM(fraction * 100.0), reinterpret_cast<LPARAM>(new std::wstring(Wide(what))));
+        },
+        &error);
+    PostMessageW(hwnd, kMsgDone, ok ? 1 : 0, reinterpret_cast<LPARAM>(new std::wstring(Wide(error))));
+  });
+}
+
 void ScanInto(Window& w, const std::wstring& folder) {
   SetWindowTextW(w.status, L"Looking through the folder...");
   UpdateWindow(w.status);
@@ -161,9 +219,9 @@ void ScanInto(Window& w, const std::wstring& folder) {
   SetWindowTextW(w.status, text);
   if (found.game.empty()) {
     MessageBoxW(w.hwnd,
-                L"No Real Steel game package in that folder.\n\nOn the Xbox 360 it is the file under "
-                L"Content\\0000000000000000\\584111E0\\000D0000\\ (about 200 MB). Copy that folder "
-                L"structure from the console's storage to this PC and pick it here.",
+                L"No Real Steel game package in that folder.\n\nCopy your own Real Steel files (the "
+                L"game, about 200 MB, and its title update) from your Xbox 360 to this PC and pick "
+                L"the folder here.",
                 L"ReCompiled Steel setup", MB_OK | MB_ICONINFORMATION);
   }
 }
@@ -175,19 +233,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (w == nullptr) break;
       const int id = LOWORD(wp);
       if (id == kGameBrowse) {
-        const std::wstring p = PickPath(hwnd, L"The game package (Content\\...\\584111E0\\000D0000\\...)", false);
+        const std::wstring p = PickPath(hwnd, L"The Real Steel game package", false);
         if (!p.empty()) SetWindowTextW(w->game, p.c_str());
       } else if (id == kUpdateBrowse) {
-        const std::wstring p = PickPath(hwnd, L"The title update package (Content\\...\\584111E0\\000B0000\\...)", false);
+        const std::wstring p = PickPath(hwnd, L"The Real Steel title update package", false);
         if (!p.empty()) SetWindowTextW(w->update, p.c_str());
       } else if (id == kAddonsBrowse) {
-        const std::wstring p = PickPath(hwnd, L"The folder with the add-on packages (Content\\...\\584111E0\\00000002)", true);
+        const std::wstring p = PickPath(hwnd, L"The folder with the Real Steel add-on packages", true);
         if (!p.empty()) SetWindowTextW(w->addons, p.c_str());
       } else if (id == kScanButton) {
         const std::wstring p = PickPath(hwnd, L"Folder holding your Real Steel files (everything in it is found)", true);
         if (!p.empty()) ScanInto(*w, p);
       } else if (id == kInstallButton) {
         if (!w->busy) StartInstall(*w);
+      } else if (id == kFightersButton) {
+        if (!w->busy) StartImport(*w);
       } else if (id == kCloseButton) {
         if (!w->busy) DestroyWindow(hwnd);
       }
@@ -212,7 +272,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       auto* error = reinterpret_cast<std::wstring*>(lp);
       if (w != nullptr) {
         SetBusy(*w, false);
-        if (wp != 0) {
+        if (wp != 0 && w->importing) {
+          SendMessageW(w->progress, PBM_SETPOS, 100, 0);
+          SetWindowTextW(w->status, L"Done. The fighters are in character select the next time the game starts.");
+          MessageBoxW(hwnd, L"The fighters are imported.\n\nThey are in character select the next time you start the game.",
+                      L"ReCompiled Steel setup", MB_OK | MB_ICONINFORMATION);
+        } else if (wp != 0) {
           SendMessageW(w->progress, PBM_SETPOS, 100, 0);
           SetWindowTextW(w->status, L"Done. You can close this window and start realsteel.exe.");
           MessageBoxW(hwnd, L"Your game files are installed.\n\nStart the game with realsteel.exe in this folder.",
@@ -223,6 +288,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           MessageBoxW(hwnd, (L"Setup failed:\n\n" + *error).c_str(), L"ReCompiled Steel setup", MB_OK | MB_ICONERROR);
         }
       }
+      if (w != nullptr) w->importing = false;
       delete error;
       return 0;
     }
@@ -265,7 +331,7 @@ int RunWindow(const Args& args) {
   SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
   w.font = CreateFontIndirectW(&ncm.lfMessageFont);
 
-  const int width = 640, height = 470;
+  const int width = 640, height = 500;
   RECT r{0, 0, width, height};
   AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
   w.hwnd = CreateWindowExW(0, wc.lpszClassName, L"ReCompiled Steel setup",
@@ -276,10 +342,9 @@ int RunWindow(const Args& args) {
   const int m = 16;
   int y = m;
   Make(w, L"STATIC",
-       L"This copies your own Real Steel files from your Xbox 360 into this folder. On the console "
-       L"they are under Content\\0000000000000000\\584111E0\\ (000D0000 = the game, 000B0000 = the "
-       L"title update, 00000002 = add-ons). Copy that folder to this PC, then either pick it with "
-       L"\"Find in a folder...\" or choose the files one by one.",
+       L"This copies your own Real Steel files from your Xbox 360 into this folder: the game, its "
+       L"title update (required) and any add-ons. Copy them to this PC, then either pick their "
+       L"folder with \"Find in a folder...\" or choose the files one by one.",
        0, m, y, width - 2 * m, 64, 0);
   y += 72;
   w.scan = Make(w, L"BUTTON", L"Find in a folder...", BS_PUSHBUTTON | WS_TABSTOP, m, y, 160, 26, kScanButton);
@@ -309,6 +374,8 @@ int RunWindow(const Args& args) {
   w.log = Make(w, L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER, m, y,
                width - 2 * m, 90, kLog);
   y += 100;
+  w.fighters = Make(w, L"BUTTON", L"Import fighters from another Yuke's game...", BS_PUSHBUTTON | WS_TABSTOP, m, y, 290, 28,
+                    kFightersButton);
   w.install = Make(w, L"BUTTON", L"Install", BS_DEFPUSHBUTTON | WS_TABSTOP, width - m - 200, y, 96, 28, kInstallButton);
   w.close = Make(w, L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, width - m - 96, y, 96, 28, kCloseButton);
 
@@ -341,7 +408,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   const Args args = ParseArgs(args_text);
 
   // From a console: the options drive it, output goes there.
-  const bool console_mode = args.help || !args.error.empty() || args.cli || !args.game.empty() || !args.scan.empty();
+  const bool console_mode =
+      args.help || !args.error.empty() || args.cli || !args.game.empty() || !args.scan.empty() || !args.fighters.empty();
   if (console_mode && AttachConsole(ATTACH_PARENT_PROCESS)) {
     FILE* f = nullptr;
     freopen_s(&f, "CONOUT$", "w", stdout);
@@ -353,6 +421,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::printf("%s", Usage().c_str());
     return args.help ? 0 : 2;
   }
+  // only importing fighters from another game (Real Steel already installed)
+  if (!args.fighters.empty() && args.game.empty() && args.scan.empty()) return RunImportConsole(args);
   if (args.cli && args.game.empty() && args.scan.empty()) {
     Args asked = args;
     if (!AskOnTerminal(&asked)) return 1;
@@ -362,7 +432,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       std::printf("%s\n", error.c_str());
       return 1;
     }
-    return RunConsole(plan);
+    const int code = RunConsole(plan);
+    return (code == 0 && !args.fighters.empty()) ? RunImportConsole(args) : code;
   }
   if (!args.game.empty() || !args.scan.empty()) {
     if (!args.yes && !args.cli) return RunWindow(args);  // choices filled in, the window confirms
@@ -372,7 +443,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       std::printf("%s\n", error.c_str());
       return 1;
     }
-    return RunConsole(plan);
+    const int code = RunConsole(plan);
+    return (code == 0 && !args.fighters.empty()) ? RunImportConsole(args) : code;
   }
   return RunWindow(args);
 }

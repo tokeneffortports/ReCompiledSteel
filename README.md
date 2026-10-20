@@ -22,22 +22,8 @@
   Linux / a Steam Deck, **or** an arm64 Android device with Vulkan 1.3, or 1.1 /
   1.2 with the extensions the game needs (tested on a Retroid Pocket Nova)
 - **Your own copy of Real Steel** from an Xbox 360: the Xbox Live Arcade game
-  and its title update, plus the add-on packs if you have them
-
-| | |
-| --- | --- |
-| Game | Real Steel, Xbox Live Arcade (Yuke's, 2011) |
-| Title ID | `584111E0` |
-| Game package | `000D0000` (Xbox Live Arcade) |
-| Title update | `000B0000`, **required** (the port is built from the updated game) |
-| Add-ons | `00000002`, optional (all 18 packs are supported) |
-| `default.xex` | 4,825,088 bytes, CRC32 `E9E26E6B`, SHA-256 `D33B4336F93896A08FA8E4DA6257BEC2B81822332FE17D1227C11A87D038ABFB` |
-| `default.xexp` (title update) | 1,390,592 bytes, CRC32 `B62B468E`, SHA-256 `8780F37E994525009F44FB929CE1A8C34DA9C9B27D72E74D4DC11FAA662A3557` |
-
-On the console the files are under `Content\0000000000000000\584111E0\`. Copy
-them off with FTP from a console running Aurora or FSD, or with a PC tool that
-reads Xbox 360 storage (Party Buffalo or Xplorer360 for a hard drive,
-USBXTAFGUI for a USB stick).
+  and its title update (**required**), plus the add-on packs if you have them
+  (all 18 are supported)
 
 ## Installing
 
@@ -63,9 +49,8 @@ Mode**. It holds 60 fps. Saves are in `~/.local/share/realsteel`.
 
 ### Android
 
-1. Copy your Xbox 360 files (the game, its title update and any add-ons, for
-   example the whole `Content` folder from your console or USB stick) to the
-   device's storage or SD card.
+1. Copy your Xbox 360 files (the game, its title update and any add-ons) to
+   the device's storage or SD card.
 2. Install **ReCompiledSteel-android-arm64-….apk** and open it.
 3. Press **Allow file access**, then **Install game files**, and pick the
    folder you copied. The installer finds the game, title update and add-ons
@@ -102,6 +87,9 @@ using the game's own shaders translated ahead of time.
 - **16:9, 16:10, 21:9 and 4:3**: the 3D view widens instead of stretching,
   and menus are laid out for the shape. The help bar sits at the bottom of
   the screen, and flashes and screen effects cover the whole picture.
+- **Frame rate** 30, 60, 90 or 120, with the game at its normal speed in
+  each. 90 and 120 are offered when the display refreshes that fast; online
+  matches play at 60, like the original.
 - 60 fps on a Steam Deck and on a Retroid Pocket Nova at its native 1280x960
 - Older Android drivers that report Vulkan 1.1 or 1.2 can work too, through
   the extensions they offer; if something is missing the game says what
@@ -129,11 +117,24 @@ exactly as made unless you turn them on:
 **Show frame rate** and **Show memory use** (game, free memory and GPU memory)
 sit in any corner you choose, to see what each option buys you.
 
+### Texture packs
+
+**Enhancements > Export textures** saves every texture the game shows as a
+PNG; **Enhancements > Texture pack** loads replacements for them, at any size,
+from a `texture_pack` folder next to the game. Upscaled packs sharpen the
+menus, logos, robot portraits and close-ups. On Windows,
+[tools/make_texture_pack.ps1](tools/make_texture_pack.ps1) (also in the
+Windows download) makes a pack from your exported textures with
+[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN), which you download
+yourself; it leaves out normal maps and other textures that don't upscale
+well. Use 2x for handhelds and 4x for a strong PC graphics card. Packs are
+made from your own copy of the game, so none come with the project.
+
 ### Settings in the game's own menus
 
 **HELP AND OPTIONS > GAME OPTIONS** has the game's own page first, then ours,
-with tabs above the panel: Display, Graphics, Audio, Controls, Game and
-Cheats. Change pages with LB / RB, or click or tap a tab. **F1** (or clicking
+with tabs above the panel: Display, Graphics, Audio, Controls, Game,
+Enhancements and Cheats. Change pages with LB / RB, or click or tap a tab. **F1** (or clicking
 both sticks) opens the same settings as an overlay anywhere in the game.
 **F11** toggles fullscreen and **F12** saves a screenshot.
 
@@ -169,6 +170,12 @@ the glow colour you pick.
 
 <img src="docs/images/new-robots.jpg" alt="ANGLER against QUILLBACK in local multiplayer" width="70%">
 
+### Fighters from Pacific Rim
+
+If you also own Yuke's **Pacific Rim** (Xbox 360), **Import fighters** in the
+setup program or the Android launcher brings its fighters into the game from
+your own copy. Nothing from Pacific Rim comes with this project.
+
 ### And the rest
 
 - **Achievements** with unlock pop-ups, and the full list in the game's menus
@@ -176,7 +183,7 @@ the glow colour you pick.
   knows
 - **Touch controls** on Android that you can arrange: drag any button where
   you want it, and change its size, shape (circle, rounded, square or a
-  curved kidney) and angle, plus overall size and see-through
+  curved kidney), angle, colour and see-through
 - **Local multiplayer** on one PC with two controllers
 - All 18 **add-on packs** (robots and stages), when you have them
 - A **Cheats** tab (game speed, cash), English or Japanese, mute in the
@@ -208,13 +215,9 @@ for your PC, Steam Deck or handheld, this is for you.
 
 ## Known issues
 
-- The **MY SCORE** page of the leaderboards stays empty; the rankings pages
-  work.
 - Online play across the internet relies on the lobby server's hole punching,
   which has been tested on few networks. A host may have to forward the UDP
   port the panel shows.
-- At 4:3 and 16:10, the full-screen fades in fights only cover the 16:9 part of
-  the picture.
 - On Android, the Retroid Pocket Nova is the main test device; a few phones
   have been tried too.
 

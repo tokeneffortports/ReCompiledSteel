@@ -8,11 +8,18 @@
 
 #include "realsteel_overlay.h"
 #include "realsteel_native_present.h"
+#include "realsteel_framerate.h"
+#include "realsteel_netplay.h"
 #include <cstring>
+#include <cstdlib>
 #include <chrono>
 #include <cstdint>
 #include <thread>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <map>
+#include <SDL3/SDL.h>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -40,6 +47,132 @@ REXCVAR_DEFINE_BOOL(realsteel_cap_outside_lock, true, "Real Steel",
                     "Wait for the frame cap with the render thread's device "
                     "lock released, so loading threads can use the wait "
                     "(robot select loads 2 s -> fraction; see sub_821A9BD0)");
+
+// Frame-rate modes (2026-10-17, ported from Pacific Rim's pr_hooks.cpp; same
+// Yuke's engine). The game logic steps once per frame, scaled by the engine's
+// frame-rate block at 0x824D77A8: +8 fps, +28 1/fps, +32 fps (float), +36 ms
+// (float), +40 ms (int), +60 / +64 speed scales (60/fps, fps/60).
+// sub_821B34F0(fps) sets 25, 30, 50 or 60; sub_821B3638 is the engine's
+// setup; sub_821B3690 / sub_821B3730 drop to 30 / raise to 60 around some
+// game states. realsteel_frame_rate picks 30, 60 (the engine's own, default),
+// 90 or 120; the game's own switches end in that mode and the frame cap
+// follows it. Online play holds 60 (both games must step alike) and the mode
+// never goes above the display's refresh rate.
+REXCVAR_DEFINE_INT32(realsteel_frame_rate, 60, "Real Steel",
+                     "Frame rate: 30, 60, 90 or 120 (the game runs at normal speed "
+                     "in each; 60 is the engine's own mode; online play uses 60)")
+    .range(30, 120)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+constexpr uint32_t kFrameBlock = 0x824D77A8;
+uint8_t* g_frame_base = nullptr;   // guest memory, from the first hooked call
+int g_applied_fps = 0;
+std::atomic<int> g_refresh_hz{-1};  // -1 = not asked yet
+
+void StoreBE32(uint8_t* base, uint32_t addr, uint32_t v) {
+  uint8_t* p = base + addr;
+  p[0] = uint8_t(v >> 24);
+  p[1] = uint8_t(v >> 16);
+  p[2] = uint8_t(v >> 8);
+  p[3] = uint8_t(v);
+}
+uint32_t FloatBits(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return u;
+}
+void ApplyFrameRate(uint8_t* base) {
+  if (base == nullptr) return;
+  const int fps = realsteel::framerate::Current();
+  const float scale = 60.0f / float(fps);
+  StoreBE32(base, kFrameBlock + 8, uint32_t(fps));
+  StoreBE32(base, kFrameBlock + 28, FloatBits(1.0f / float(fps)));
+  StoreBE32(base, kFrameBlock + 32, FloatBits(float(fps)));
+  StoreBE32(base, kFrameBlock + 36, FloatBits(1000.0f / float(fps)));
+  StoreBE32(base, kFrameBlock + 40, uint32_t(1000 / fps));
+  StoreBE32(base, kFrameBlock + 60, FloatBits(scale));
+  StoreBE32(base, kFrameBlock + 64, FloatBits(1.0f / scale));
+  if (fps != g_applied_fps) {
+    g_applied_fps = fps;
+    REXLOG_INFO("[framerate] engine frame-rate mode {} fps (setting {}, display {} Hz{})", fps,
+                REXCVAR_GET(realsteel_frame_rate), realsteel::framerate::DisplayRefreshHz(),
+                realsteel::netplay::InMatch() ? ", online: 60" : "");
+  }
+}
+}  // namespace
+
+int realsteel::framerate::DisplayRefreshHz() {
+  int hz = g_refresh_hz.load();
+  if (hz < 0) {
+    hz = 0;
+    if (SDL_WasInit(SDL_INIT_VIDEO)) {
+      if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay())) {
+        hz = int(mode->refresh_rate + 0.5f);
+      }
+    }
+    if (hz > 0) g_refresh_hz.store(hz);   // asked again until SDL knows
+  }
+  return hz;
+}
+
+int realsteel::framerate::Current() {
+  const int want = REXCVAR_GET(realsteel_frame_rate);
+  int fps = want >= 105 ? 120 : want >= 75 ? 90 : want >= 45 ? 60 : 30;
+  if (realsteel::netplay::InMatch()) return 60;
+  const int hz = DisplayRefreshHz();
+  if (hz > 0 && fps > hz + 1) fps = hz + 1 >= 90 ? 90 : 60;   // the display cannot show it
+  return fps;
+}
+
+// The engine's frame-rate setup (init: sets the block from its config, then
+// calls sub_821B34F0): afterwards the chosen mode.
+extern "C" REX_FUNC(sub_821B3638) {
+  __imp__sub_821B3638(ctx, base);
+  g_frame_base = base;
+  ApplyFrameRate(base);
+}
+// SetFrameRate(fps): any request ends in the chosen mode.
+extern "C" REX_FUNC(sub_821B34F0) {
+  __imp__sub_821B34F0(ctx, base);
+  g_frame_base = base;
+  ApplyFrameRate(base);
+}
+// The game's own drop-to-30 / raise-to-60 around some states: the chosen mode.
+extern "C" REX_FUNC(sub_821B3690) {
+  g_frame_base = base;
+  ApplyFrameRate(base);
+}
+extern "C" REX_FUNC(sub_821B3730) {
+  g_frame_base = base;
+  ApplyFrameRate(base);
+}
+
+// sub_823F2F28(obj r3, index r4) advances a counter by 60 / fps whole
+// steps (obj + (index + 2052) * 4; 2 at 30, 1 at 60). Above 60 that is 0
+// and the counter stood still: fights at 90 / 120 stayed almost black (the
+// arena lighting never faded in). The fraction is kept here and whole steps
+// are added before the game's own (zero) step.
+extern "C" REX_FUNC(sub_823F2F28) {
+  const int fps = int(REX_LOAD_U32(kFrameBlock + 8));
+  if (fps > 60) {
+    static std::mutex m;
+    static std::map<uint64_t, double> carry;
+    const uint32_t counter = ctx.r3.u32 + ((ctx.r4.u32 + 2052u) << 2);
+    int whole = 0;
+    {
+      std::lock_guard<std::mutex> lock(m);
+      double& c = carry[(uint64_t(ctx.r3.u32) << 32) | ctx.r4.u32];
+      c += 60.0 / double(fps);
+      whole = int(c);
+      c -= whole;
+    }
+    if (whole != 0) REX_STORE_U32(counter, REX_LOAD_U32(counter) + uint32_t(whole));
+  }
+  __imp__sub_823F2F28(ctx, base);
+}
+
+
 
 namespace {
 using clock = std::chrono::steady_clock;
@@ -169,7 +302,11 @@ void SwapPace() {
     REXLOG_INFO("[tickrate] VdSwap call site reached (swap {})", g_total_swaps);
   }
   clock::time_point now = clock::now();
-  const double cap = REXCVAR_GET(realsteel_guest_fps_cap);
+  // The frame-rate mode: a mode change reaches the engine here as well; the
+  // Game speed setting (realsteel_guest_fps_cap, 60 = normal) scales the cap.
+  if (g_frame_base != nullptr && realsteel::framerate::Current() != g_applied_fps) ApplyFrameRate(g_frame_base);
+  const double speed_cap = REXCVAR_GET(realsteel_guest_fps_cap);
+  const double cap = speed_cap * double(g_applied_fps > 0 ? g_applied_fps : 60) / 60.0;
   if (g_frame_start.time_since_epoch().count() != 0) {
     g_busy_ms += std::chrono::duration<double, std::milli>(now - g_frame_start).count();
   }

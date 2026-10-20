@@ -40,6 +40,10 @@ std::string ModsNotice();
 void SetModsSignature(const std::string& signature);
 // The name shown to other players.
 std::string OnlineName();
+// True while game traffic goes to another player (an online match or its
+// lobby; the last few seconds). The frame rate is held at 60 then: both
+// games must step the same way.
+bool InMatch();
 // Leaderboards, kept by the lobby server (2026-10-09).
 struct StatsProperty {
   uint32_t id = 0;

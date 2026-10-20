@@ -81,6 +81,7 @@ uint16_t le16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
 void put_le32(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
 void put_le16(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; }
 uint32_t be32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+void put_be32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 void app_le32(Bytes& b, uint32_t v) { uint8_t t[4]; put_le32(t, v); b.insert(b.end(), t, t + 4); }
 void app_le16(Bytes& b, uint32_t v) { uint8_t t[2]; put_le16(t, v); b.insert(b.end(), t, t + 2); }
 void app_be32(Bytes& b, uint32_t v) { b.insert(b.end(), {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}); }
@@ -694,6 +695,116 @@ struct Robot {
   int wanted_index = -1;          // robot.txt "id = N": the index to use (0..959)
   bool from_source = false;       // models are made here from the folder's OBJ / PNG files
   std::string sig;                // this robot's part of the install signature
+  // A full robot (kind = full): its own entry in character select, one
+  // skinned body in a character pack (character.bin, made by an importer on
+  // the player's machine), its own icons; its parts only carry its stats.
+  bool full = false;
+  int robot_index = -1;           // robot = N: index in the robot database (see kFullRobotSlots)
+  int character = 0;              // character = N: character pack entry /EMD/<N><variant>
+  std::string full_name, title, owner;
+  int sort = 0;                   // sort = N: place in character select (stock keys 0x0B..0xD2)
+  // stages = <stage>:<rank> ...: places in the single-player DLC stages 4-9
+  // (rank 1 = the stage's boss); stage_<n>_name = its menu name
+  std::vector<std::pair<int, int>> stages;
+  std::map<int, std::string> stage_names;
+  bool select = true;             // select = 0: not in character select (e.g. a stage-only boosted copy)
+};
+
+// Robot indices a full robot may use: 52..59 are kept for the importers this
+// port ships (Pacific Rim Jaegers 52-56, ...), the rest are free for others.
+// Indices the game does not load by itself are enabled by the hook in
+// realsteel_robots.cpp (FullRobotIndices).
+bool full_robot_slot_ok(int index) {
+  return (index >= 52 && index <= 59) || (index >= 78 && index <= 99) || (index >= 116 && index <= 119) ||
+         (index >= 126 && index <= 129) || (index >= 203 && index <= 219);
+}
+std::vector<int> g_full_robot_indices;
+std::vector<int> g_full_robot_hidden;   // select = 0
+std::map<int, std::vector<uint32_t>> g_full_robot_parts;   // robot index -> part ids of slots 1..10
+std::map<int, std::string> g_full_robot_names;
+std::map<int, fs::path> g_full_robot_folders;
+std::vector<uint8_t> g_full_robot_motions, g_full_robot_motion_events;
+std::map<int, std::map<uint16_t, uint16_t>> g_full_robot_motion_map;   // robot -> act -> its own act
+
+// --- character packs (EPK8: one group of entries with 8-character names
+// "%06d%02d" = character number + colour variant, each a PACH) ---------------
+
+struct CharacterPack {
+  Bytes head;                                     // the first 0x4000 bytes
+  std::string group;                              // "EMD "
+  std::vector<std::pair<std::string, Bytes>> entries;
+  Bytes trailer;
+  std::vector<std::tuple<std::string, uint32_t, uint32_t>> placed;   // after save
+
+  explicit CharacterPack(const fs::path& path) {
+    Bytes d = read_file(path);
+    if (d.size() < kDataStart || std::memcmp(d.data(), "EPK8", 4) != 0) throw Failure("not a character pack: " + path.string());
+    const uint32_t data_size = le32(&d[8]);
+    head.assign(d.begin(), d.begin() + kDataStart);
+    group.assign(reinterpret_cast<const char*>(&d[0x800]), 4);
+    const uint32_t count = (le32(&d[0x804]) & 0xFFFF) / 4;
+    for (uint32_t i = 0; i < count; ++i) {
+      const size_t o = 0x80C + size_t(i) * 16;
+      const uint32_t sector = le32(&d[o + 8]), units = le32(&d[o + 12]);
+      const size_t start = kDataStart + size_t(sector) * 0x800;
+      if (start + size_t(units) * 0x100 > d.size()) throw Failure("truncated character pack: " + path.string());
+      entries.emplace_back(std::string(reinterpret_cast<const char*>(&d[o]), 8),
+                           Bytes(d.begin() + start, d.begin() + start + size_t(units) * 0x100));
+    }
+    trailer.assign(d.begin() + std::min(d.size(), kDataStart + size_t(data_size)), d.end());
+  }
+
+  void put(const std::string& name, Bytes blob) {
+    for (auto& e : entries)
+      if (e.first == name) {
+        e.second = std::move(blob);
+        return;
+      }
+    entries.emplace_back(name, std::move(blob));
+  }
+
+  void save(const fs::path& path) {
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    Bytes directory, body;
+    app(directory, group);
+    app_le32(directory, 0x10000u | uint32_t(entries.size() * 4));
+    app_le32(directory, 0);
+    placed.clear();
+    for (auto& [name, blob] : entries) {
+      Bytes raw = blob;
+      pad_to(raw, 0x100);
+      const uint32_t sector = uint32_t(body.size() / 0x800), units = uint32_t(raw.size() / 0x100);
+      app(directory, name);
+      app_le32(directory, sector);
+      app_le32(directory, units);
+      placed.emplace_back(name, sector, units);
+      app(body, raw);
+      pad_to(body, 0x800);
+    }
+    if (0x800 + directory.size() > kDataStart) throw Failure("character pack directory too large");
+    Bytes out = head;
+    std::fill(out.begin() + 0x800, out.end(), 0);
+    std::copy(directory.begin(), directory.end(), out.begin() + 0x800);
+    put_le32(&out[4], uint32_t(directory.size()));
+    put_le32(&out[8], uint32_t(body.size()));
+    app(out, body);
+    app(out, trailer);
+    write_file(path, out);
+  }
+
+  // Its section of an index file (8-character names: flag 0x1000).
+  Bytes index_section() const {
+    Bytes out;
+    app(out, group);
+    app_be32(out, (uint32_t(placed.size() * 4) << 20) | 0x1000);
+    app_be32(out, 0);
+    for (const auto& [name, sector, units] : placed) {
+      app(out, name);
+      app_be32(out, sector);
+      app_be32(out, units);
+    }
+    return out;
+  }
 };
 
 // The archives a base set's models come from: the base game's, or the
@@ -734,10 +845,348 @@ void copy_or_link(const fs::path& from, const fs::path& to) {
   if (ec) fs::copy_file(from, to, fs::copy_options::overwrite_existing);
 }
 
+// A PACH child by name, added (in id order) when missing.
+Node* child_or_add(Node* parent, const std::string& name, const Bytes& data) {
+  if (Node* c = parent->child(name)) {
+    c->set_data(data);
+    return c;
+  }
+  auto node = std::make_unique<Node>(name, data);
+  node->parent = parent;
+  node->touch();
+  Node* raw = node.get();
+  auto pos = parent->children.begin();
+  const unsigned long id = std::strtoul(name.c_str(), nullptr, 16);
+  while (pos != parent->children.end() && std::strtoul((*pos)->name.c_str(), nullptr, 16) < id) ++pos;
+  parent->children.insert(pos, std::move(node));
+  parent->touch();
+  return raw;
+}
+
+void put_text(Bytes& rec, size_t off, size_t len, const std::string& text) {
+  for (size_t i = 0; i < len; ++i) rec[off + i] = i < text.size() && i + 1 < len ? uint8_t(text[i]) : 0;
+}
+
+// The full robot's database records (chEtc.pac /CHAR/DAT and /CHAR/PRO:
+// 4-byte head + 420-byte definition, little-endian in the file; 132-byte
+// move set), copied from Atom's character-select entry (robot 100).
+//   +28 u16 index, +30 name, +98 title, +292 owner, +392 1 = listed,
+//   +398 u16 sort key, +400 index, +412 character pack, +414 0 = one body
+//   (not parts), +415 2 = add-on type without an ownership check (indices
+//   below 100 are listed only as add-on robots), +416 0 = shown in select.
+void add_full_robot_records(Archive& chetc, const Robot& robot) {
+  constexpr uint32_t kSource = 100;
+  Node* dat = chetc.find("/CHAR/DAT");
+  Node* pro = chetc.find("/CHAR/PRO");
+  if (dat == nullptr || pro == nullptr) throw Failure("chEtc.pac has no robot database");
+  Node* src_dat = dat->child(hex4(kSource));
+  Node* src_pro = pro->child(hex4(kSource));
+  if (src_dat == nullptr || src_pro == nullptr || src_dat->data.size() < 424) throw Failure("robot database without Atom");
+  Bytes rec = src_dat->data;
+  const size_t b = 4;
+  put_le16(&rec[b + 28], uint32_t(robot.robot_index));
+  put_text(rec, b + 30, 32, robot.full_name);
+  put_text(rec, b + 98, 48, robot.title);
+  put_text(rec, b + 292, 64, robot.owner);
+  rec[b + 392] = 1;
+  if (robot.sort > 0) put_le16(&rec[b + 398], uint32_t(robot.sort));
+  rec[b + 400] = uint8_t(robot.robot_index);
+  rec[b + 412] = uint8_t(robot.character);
+  rec[b + 414] = 0;
+  rec[b + 415] = robot.robot_index < 100 ? 2 : 0;
+  rec[b + 416] = 0;
+  child_or_add(dat, hex4(uint32_t(robot.robot_index)), rec);
+  // its own move list (pro.bin: 66 u16 act ids, e.g. the Pacific Rim
+  // importer's) or Atom's
+  const fs::path own_pro = robot.models / "pro.bin";
+  Bytes moves = fs::is_regular_file(own_pro) ? read_file(own_pro) : src_pro->data;
+  if (moves.size() != src_pro->data.size()) moves = src_pro->data;
+  child_or_add(pro, hex4(uint32_t(robot.robot_index)), moves);
+}
+
+// Motion banks of full robots (motions.bin / motion_events.bin, made by the
+// Pacific Rim importer): Real Steel's bank layout (0x1000 bytes of bone
+// names, track sets and descriptors up to the directory, a u32 count of
+// 32-byte entries {u32 key, u32 data offset, ...}, the data). Banks made
+// with the same header merge into one: entries sorted by key, data
+// re-offset. Event banks: 256-byte command length table, u32 count of
+// 32-byte entries {u32 key, u32 offset, u16 size, ...}, the streams.
+struct MotionItem {
+  uint32_t key;
+  Bytes entry;   // 32 bytes
+  Bytes data;
+};
+
+std::vector<MotionItem> motion_items(const Bytes& d, size_t dir, bool events) {
+  if (d.size() < dir + 4) throw Failure("motion bank too short");
+  const uint32_t n = be32(&d[dir]);
+  const size_t base = dir + 4 + size_t(n) * 32;
+  if (base > d.size()) throw Failure("motion bank directory past its end");
+  std::vector<uint32_t> offs;
+  for (uint32_t i = 0; i < n; ++i) offs.push_back(be32(&d[dir + 4 + i * 32 + 4]));
+  std::vector<uint32_t> sorted = offs;
+  std::sort(sorted.begin(), sorted.end());
+  std::vector<MotionItem> out;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint8_t* e = &d[dir + 4 + i * 32];
+    size_t size;
+    if (events) {
+      size = (size_t(e[8]) << 8) | e[9];
+    } else {
+      auto next = std::upper_bound(sorted.begin(), sorted.end(), offs[i]);
+      size = (next == sorted.end() ? d.size() - base : *next) - offs[i];
+    }
+    if (base + offs[i] + size > d.size()) throw Failure("motion data past the bank's end");
+    out.push_back({be32(e), Bytes(e, e + 32), Bytes(d.begin() + base + offs[i], d.begin() + base + offs[i] + size)});
+  }
+  return out;
+}
+
+Bytes merge_motion_banks(const std::vector<Bytes>& banks, bool events) {
+  // the directory: events at 0x100; motions at 0x1000 + the u16 at 0x1000
+  auto dir_of = [&](const Bytes& d) -> size_t {
+    if (events) return 0x100;
+    if (d.size() < 0x1004) throw Failure("motion bank too short");
+    return 0x1000 + ((size_t(d[0x1000]) << 8) | d[0x1001]);
+  };
+  const size_t dir = dir_of(banks.front());
+  std::map<uint32_t, MotionItem> items;
+  for (const Bytes& b : banks) {
+    if (dir_of(b) != dir || std::memcmp(b.data(), banks.front().data(), dir) != 0)
+      throw Failure("motion banks with different headers");
+    for (MotionItem& m : motion_items(b, dir, events))
+      if (!items.count(m.key)) items.emplace(m.key, std::move(m));
+  }
+  Bytes out(banks.front().begin(), banks.front().begin() + dir), body;
+  app_be32(out, uint32_t(items.size()));
+  for (auto& [key, m] : items) {
+    Bytes e = m.entry;
+    const uint32_t off = uint32_t(body.size());
+    e[4] = uint8_t(off >> 24), e[5] = uint8_t(off >> 16), e[6] = uint8_t(off >> 8), e[7] = uint8_t(off);
+    app(out, e);
+    app(body, m.data);
+  }
+  app(out, body);
+  return out;
+}
+
+// A full robot's move data (motion_records.bin: 116-byte records, BE u32
+// key = act << 16 | sub << 8 | track first, like the motions) added to the
+// table the game reads per motion (misc /BATS|BATH/INIT/000D/0000: BE u32
+// count, records sorted by key): hit windows, damage, power... Without a
+// record the game does not use a motion as a move.
+void add_motion_records(Archive& misc, const Robot& robot) {
+  const fs::path file = robot.models / "motion_records.bin";
+  if (!fs::is_regular_file(file)) return;
+  const Bytes add = read_file(file);
+  constexpr size_t kRecord = 116;
+  if (add.size() % kRecord) throw Failure(file.string() + ": not whole 116-byte records");
+  for (const char* section : {"BATS", "BATH"}) {
+    Node* node = misc.find(std::string("/") + section + "/INIT/000D/0000");
+    if (node == nullptr) continue;
+    const Bytes& d = node->data;
+    if (d.size() < 4) continue;
+    std::map<uint32_t, Bytes> recs;
+    const uint32_t n = be32(&d[0]);
+    if (4 + size_t(n) * kRecord > d.size()) throw Failure("move data table shorter than its count");
+    for (uint32_t i = 0; i < n; ++i) recs.emplace(be32(&d[4 + i * kRecord]), Bytes(d.begin() + 4 + i * kRecord, d.begin() + 4 + (i + 1) * kRecord));
+    for (size_t i = 0; i < add.size(); i += kRecord) recs.emplace(be32(&add[i]), Bytes(add.begin() + i, add.begin() + i + kRecord));
+    Bytes out;
+    app_be32(out, uint32_t(recs.size()));
+    for (auto& [key, r] : recs) app(out, r);
+    out.insert(out.end(), d.begin() + 4 + size_t(n) * kRecord, d.end());   // anything after the records
+    node->set_data(out);
+  }
+}
+
+// The full robots' motions merged into one bank (the robots hook installs
+// it as motion slot 2 when the game loads its own) and each robot's
+// motion_map.txt ("<act> <act in motions.bin>" lines: the robot plays its
+// own motion for that move; the move keeps its data and event scripts).
+void merge_full_robot_motions(const std::vector<const Robot*>& robots) {
+  std::vector<Bytes> banks, events;
+  g_full_robot_motion_map.clear();
+  for (const Robot* r : robots) {
+    const fs::path b = r->models / "motions.bin", e = r->models / "motion_events.bin", m = r->models / "motion_map.txt";
+    if (!fs::is_regular_file(b)) continue;
+    banks.push_back(read_file(b));
+    if (fs::is_regular_file(e)) events.push_back(read_file(e));
+    std::ifstream f(m);
+    std::string line;
+    while (std::getline(f, line)) {
+      unsigned act = 0, own = 0;
+      if (line.empty() || line[0] == '#' || std::sscanf(line.c_str(), "%u %u", &act, &own) != 2) continue;
+      if (act < 0x10000 && own < 0x10000) g_full_robot_motion_map[r->robot_index][uint16_t(act)] = uint16_t(own);
+    }
+  }
+  g_full_robot_motions.clear();
+  g_full_robot_motion_events.clear();
+  if (banks.empty()) return;
+  g_full_robot_motions = merge_motion_banks(banks, false);
+  if (!events.empty()) g_full_robot_motion_events = merge_motion_banks(events, true);
+  REXLOG_INFO("[mods] motions of {} full robot(s): {} + {} bytes", banks.size(), g_full_robot_motions.size(),
+              g_full_robot_motion_events.size());
+}
+
+// The robot's loadout (misc.pac /BATS|BATH/INIT/001F/0000/<n>: u16 entry
+// count, u16 robot index, then 68-byte entries of u16 part id, u8 slot,
+// paint...): Atom's, with the robot's own parts in slots 1..7 (the chip
+// slots 8..10 stay Atom's).
+void add_loadout(Archive& misc, const Robot& robot, const Ids& ids) {
+  constexpr uint32_t kSource = 100;
+  for (const char* section : {"BATS", "BATH"}) {
+    Node* table = misc.find(std::string("/") + section + "/INIT/001F/0000");
+    if (table == nullptr) continue;
+    const Bytes* src = nullptr;
+    unsigned long last = 0;
+    for (auto& c : table->children) {
+      last = std::max(last, std::strtoul(c->name.c_str(), nullptr, 16));
+      if (src == nullptr && c->data.size() >= 4 && le16(&c->data[2]) == kSource) src = &c->data;
+    }
+    if (src == nullptr) throw Failure("no loadout for Atom in misc.pac");
+    Bytes rec = *src;
+    put_le16(&rec[2], uint32_t(robot.robot_index));
+    const uint32_t count = le16(&rec[0]);
+    for (uint32_t k = 0; k < count && 4 + (k + 1) * 68 <= rec.size(); ++k) {
+      const int slot = rec[4 + k * 68 + 2];
+      if (slot >= 1 && slot <= 7 && ids.count(slot)) put_le16(&rec[4 + k * 68], ids.at(slot));
+    }
+    // replace this robot's loadout if the table has one, else add one
+    std::string name = hex4(uint32_t(last + 1));
+    for (auto& c : table->children)
+      if (c->data.size() >= 4 && le16(&c->data[2]) == uint32_t(robot.robot_index)) name = c->name;
+    child_or_add(table, name, rec);
+  }
+}
+
+// Character-select icons (DLC_HD.pac /MENU/SSFD/000N/<index>, DXT5 DDS:
+// 128x128 player 1, 128x128 player 2, 128x256 large) and the menu model's
+// placement / idle rows (/MMDL/BIND/0000 'MMPS' count at +44, 36-byte rows
+// from +48; /MMDL/BIND/000A 'MMMN' count at +24, 12-byte rows from +28 -
+// each row starting with the robot index), copied from Atom's (100).
+void add_menu_rows(Node* node, size_t count_off, size_t first, size_t size, uint32_t index) {
+  Bytes d = node->data;
+  const uint32_t n = le32(&d[count_off]);
+  std::vector<Bytes> rows;
+  const Bytes* src = nullptr;
+  for (uint32_t i = 0; i < n; ++i) {
+    rows.emplace_back(d.begin() + first + i * size, d.begin() + first + (i + 1) * size);
+    if (le32(rows.back().data()) == index) return;
+  }
+  for (auto& r : rows)
+    if (le32(r.data()) == 100) src = &r;
+  if (src == nullptr) return;
+  Bytes row = *src;
+  put_le32(row.data(), index);
+  rows.push_back(row);
+  std::sort(rows.begin(), rows.end(), [](const Bytes& a, const Bytes& c) { return le32(a.data()) < le32(c.data()); });
+  Bytes out(d.begin(), d.begin() + first);
+  for (auto& r : rows) app(out, r);
+  out.insert(out.end(), d.begin() + first + n * size, d.end());
+  put_le32(&out[count_off], uint32_t(rows.size()));
+  node->set_data(std::move(out));
+}
+
+void add_full_robot_menu(Archive& dlc_hd, const Robot& robot) {
+  const uint32_t index = uint32_t(robot.robot_index);
+  for (const char* size : {"0000", "0001", "0002"}) {
+    Node* node = dlc_hd.find(std::string("/MENU/SSFD/") + size);
+    if (node == nullptr) throw Failure("DLC_HD.pac has no select icons");
+    const fs::path icon = robot.models / (std::string("icon_") + size + ".dds");
+    Bytes data = fs::is_regular_file(icon) ? read_file(icon) : Bytes();
+    if (data.empty()) {
+      Node* atom = node->child(hex4(100));
+      if (atom == nullptr) throw Failure("no stock icon to stand in");
+      data = atom->data;
+    }
+    child_or_add(node, hex4(index), data);
+  }
+  if (Node* mmps = dlc_hd.find("/MMDL/BIND/0000")) add_menu_rows(mmps, 44, 48, 36, index);
+  if (Node* mmmn = dlc_hd.find("/MMDL/BIND/000A")) add_menu_rows(mmmn, 24, 28, 12, index);
+}
+
 uint64_t filetime_now() {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
   const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now).count();
   return (uint64_t(secs) + 11644473600ull) * 10000000ull;
+}
+
+// Single-player stages for full robots (2026-10-17). misc.pac
+// /BATS|BATH/INIT/0004/<n> = 16 stage records (BE: u32 0, u32 4, then 4
+// opponent slots of 0x70: +0 rank, +4 robot index, +8 opponent id, +0C/+10
+// prize money, +14 difficulty, flags, +30 part drops); records 6-14 are
+// DOWNLOADED STAGES 1-9 (9-14 placeholders in the game data). A stage shows
+// when its event (HID /INIT/0006, 4 bytes per event from +8: exists, flags,
+// message) has flag 0x08: DLC stage n <- event 59 + n. Names: strings
+// 30238 + record, 69 / 85 / 205 + n - 1 (menu item, ladder title, ...), 158 + n - 1 (help line).
+// A stage is made only when four robots fill ranks 1-4; the other fields
+// come from DLC stage 3 (record 8).
+void add_full_robot_stages(Archive& misc, Archive* tu, Archive& text, const std::vector<Robot>& robots) {
+  std::map<uint32_t, std::string> names;
+  for (int stage = 4; stage <= 9; ++stage) {
+    int by_rank[5] = {0, 0, 0, 0, 0};
+    std::string name;
+    for (const Robot& robot : robots) {
+      if (!robot.full || robot.models.empty()) continue;
+      for (const auto& [st, rank] : robot.stages)
+        if (st == stage) by_rank[rank] = robot.robot_index;
+      auto it = robot.stage_names.find(stage);
+      if (it != robot.stage_names.end() && name.empty()) name = it->second;
+    }
+    if (!by_rank[1] || !by_rank[2] || !by_rank[3] || !by_rank[4]) continue;
+    const int record = 5 + stage;
+    for (Archive* a : {&misc, tu}) {
+      if (a == nullptr) continue;
+      for (const char* section : {"BATS", "BATH"}) {
+        const std::string p = std::string("/") + section + "/INIT/";
+        Node* tmpl = a->find(p + "0004/0008");
+        Node* node = a->find(p + "0004/" + hex4(record));
+        Node* events = a->find(p + "0006");   // the HID table (a leaf at /<section>/INIT/0006)
+        if (tmpl == nullptr || node == nullptr || tmpl->data.size() < 8 + 4 * 0x70) continue;
+        Bytes d = tmpl->data;
+        for (int slot = 0; slot < 4; ++slot) {
+          uint8_t* o = &d[8 + slot * 0x70];
+          const uint32_t rank = be32(o);
+          if (rank >= 1 && rank <= 4) put_be32(o + 4, uint32_t(by_rank[rank]));
+        }
+        node->set_data(d);
+        const size_t ev = 8 + size_t(59 + stage) * 4;
+        if (events != nullptr && events->data.size() > ev + 1) {
+          Bytes e = events->data;
+          if (e[ev] == 0) e[ev] = 1;
+          e[ev + 1] |= 0x08;
+          events->set_data(e);
+        }
+      }
+    }
+    if (!name.empty()) {
+      names[30238 + record] = name;
+      names[69 + stage - 1] = name;
+      names[85 + stage - 1] = name;
+      names[205 + stage - 1] = name;
+      names[158 + stage - 1] = "Go to " + name;
+    }
+    REXLOG_INFO("[mods] stage {} ({}): {:X} {:X} {:X} {:X}", stage, name, by_rank[1], by_rank[2], by_rank[3], by_rank[4]);
+  }
+  if (names.empty()) return;
+  for (auto& g : text.groups)
+    for (auto& entry : g.nodes)
+      entry->walk([&](Node& node) {
+        if (node.has_children || node.data.size() <= 24) return;
+        auto strings = read_strings(node);
+        bool changed = false;
+        for (auto& [id, value_text] : names) {
+          auto it = strings.find(id);
+          if (it == strings.end()) continue;
+          Bytes value(value_text.begin(), value_text.end());
+          value.push_back(0);
+          if (it->second != value) {
+            it->second = value;
+            changed = true;
+          }
+        }
+        if (changed) write_strings(&node, strings);
+      });
 }
 
 void build_package(const fs::path& root, const fs::path& game, const fs::path& update_in, const fs::path& update_out,
@@ -778,6 +1227,18 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
       stock_max[slot] = next_part_id(menu) - 1;
     }
 
+    // full robots: the robot database, the select screen's icons and menu
+    // rows, and a character pack for their bodies (loaded when needed)
+    std::unique_ptr<Archive> chetc, dlc_hd;
+    std::unique_ptr<CharacterPack> ch_pack;
+    constexpr const char* kCharacterPack = "pac/ch/ch100.pac";
+    for (const Robot& robot : robots) {
+      if (!robot.full || robot.models.empty()) continue;
+      if (!chetc) chetc = std::make_unique<Archive>(src / "pac" / "ch" / "chEtc.pac");
+      if (!dlc_hd) dlc_hd = std::make_unique<Archive>(src / "pac" / "DLC_HD.pac");
+      if (!ch_pack) ch_pack = std::make_unique<CharacterPack>(src / kCharacterPack);
+    }
+
     // the stock archives the base sets' models come from, loaded when needed
     std::map<std::string, std::unique_ptr<Archive>> stock;
     auto stock_archive = [&](int group, int n) -> Archive* {
@@ -795,7 +1256,10 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
       // the catalog's set number indexes a 20-entry table in the game (any
       // larger value corrupts memory), so robots share set numbers 1..19
       const uint32_t set_no = uint32_t(robot.index % 19) + 1;
-      const Base base = resolve_base(robot.base, tu, text);
+      // full robots take Atom's movie parts (group 0, id 0) for their stats
+      // records unless based_on names a set
+      const Base base = robot.full && (robot.base.empty() || robot.base == "ATOM/MOVIE") ? Base{0, 0}
+                                                                                          : resolve_base(robot.base, tu, text);
       const std::string src_group = hex4(base.group);
       Ids ids;
       for (int slot = 1; slot <= 10; ++slot) ids[slot] = stock_max[slot] + 1 + uint32_t(robot.index);
@@ -807,12 +1271,40 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
         add_part_tables(menu, stats, misc.find(p + "001D/" + src_group), misc.find(p + "001E/" + src_group), base.id, ids, nullptr, paint,
                         &robot.stats);
       }
-      add_part_tables(edit.find("/EDIT/MENU/0000"), nullptr, misc.find("/BATS/INIT/001D/" + src_group), nullptr, base.id, ids, nullptr, paint);
+      if (!robot.full)
+        add_part_tables(edit.find("/EDIT/MENU/0000"), nullptr, misc.find("/BATS/INIT/001D/" + src_group), nullptr, base.id, ids, nullptr, paint);
       const Strings strings = add_strings(text, tu.find("/BATS/INIT/001D/" + src_group), base.id, robot.name);
       for (const char* section : {"BATS", "BATH"}) {
         const std::string p = std::string("/") + section + "/INIT/";
         add_part_tables(tu.find(p + "001D/" + kGroup), tu.find(p + "001E/" + kGroup), tu.find(p + "001D/" + src_group),
                         tu.find(p + "001E/" + src_group), base.id, ids, &strings, paint, &robot.stats);
+      }
+
+      if (robot.full) {
+        // A full robot: loadout -> its parts (their stats), its database
+        // records, select icons, menu rows and its body in a character pack
+        // (entries /EMD/<character><variant>, variants 02 12 22 = colours).
+        if (!robot.models.empty()) {
+          add_loadout(misc, robot, ids);
+          add_loadout(tu, robot, ids);
+          add_motion_records(misc, robot);
+          add_motion_records(tu, robot);
+          add_full_robot_records(*chetc, robot);
+          add_full_robot_menu(*dlc_hd, robot);
+          for (const char* variant : {"02", "12", "22"}) {
+            fs::path body = robot.models / (std::string("character_") + variant + ".bin");
+            if (!fs::is_regular_file(body)) body = robot.models / "character.bin";
+            char name[16];
+            std::snprintf(name, sizeof(name), "%06d%s", robot.character, variant);
+            ch_pack->put(name, read_file(body));
+          }
+        }
+        ids_text += std::to_string(robot.index);
+        for (int slot = 1; slot <= 10; ++slot) ids_text += ' ' + std::to_string(ids[slot]);
+        ids_text += ' ' + robot.name + '\n';
+        REXLOG_INFO("[mods] full robot {} as robot {} (character {}), stats parts body {:X}", robot.full_name, robot.robot_index,
+                    robot.character, ids[1]);
+        continue;
       }
 
       // models and textures: a copy of the base set's entries (from its own
@@ -912,6 +1404,7 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
       REXLOG_INFO("[mods] robot {}{} (based on {}): body {:X} head {:X}", robot.name,
                   robot.models.empty() ? " (placeholder, folder removed)" : "", robot.base, ids[1], ids[3]);
     }
+    add_full_robot_stages(misc, &tu, text, robots);
     {
       std::ofstream ids_file(root / "mods_ids.txt", std::ios::binary);
       ids_file << ids_text;
@@ -930,12 +1423,16 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
       std::snprintf(f, sizeof(f), "pac/edit/%s_ed%02d.pac", kFilePrefix, n);
       changed[f] = eds[n].get();
     }
+    if (chetc) changed["pac/ch/chEtc.pac"] = chetc.get();
+    if (dlc_hd) changed["pac/DLC_HD.pac"] = dlc_hd.get();
     for (auto& e : fs::recursive_directory_iterator(src)) {
       if (!e.is_regular_file()) continue;
       std::string rel = fs::relative(e.path(), src).generic_string();
       const fs::path target = out / rel;
       if (changed.count(rel)) {
         changed[rel]->save(target);
+      } else if (ch_pack && rel == kCharacterPack) {
+        ch_pack->save(target);
       } else if (rel != "info/catalog.dlc" && rel != "info/catalog_hd.arc" && rel != "info/catalog_sd.arc") {
         copy_or_link(e.path(), target);
       }
@@ -983,6 +1480,12 @@ void build_package(const fs::path& root, const fs::path& game, const fs::path& u
         if (it == indices.end()) throw Failure("file table has no entry for " + rel);
         const int index = which == 0 ? it->second.first : it->second.second;
         if (index >= 0 && size_t(index) < sections.size()) sections[index] = archive->index_section();
+      }
+      if (ch_pack) {
+        const auto it = indices.find(kCharacterPack);
+        if (it == indices.end()) throw Failure(std::string("file table has no entry for ") + kCharacterPack);
+        const int index = which == 0 ? it->second.first : it->second.second;
+        if (index >= 0 && size_t(index) < sections.size()) sections[index] = ch_pack->index_section();
       }
       write_file(out / "info" / arc_name, arc_join(sections));
     }
@@ -1079,7 +1582,7 @@ std::vector<int> StatSlots(const std::string& section) {
 }
 
 std::string read_name(const fs::path& robot_txt, std::string* base = nullptr, StatOverrides* stats = nullptr,
-                      int* wanted_index = nullptr) {
+                      int* wanted_index = nullptr, std::map<std::string, std::string>* keys = nullptr) {
   std::ifstream f(robot_txt);
   std::string line, name, section;
   while (std::getline(f, line)) {
@@ -1101,6 +1604,9 @@ std::string read_name(const fs::path& robot_txt, std::string* base = nullptr, St
     trim(key);
     trim(value);
     for (char& c : key) c = char(std::tolower(uint8_t(c)));
+    // [feel]: robot-wide figures of a full robot, read by the robot lab
+    // (realsteel_robots.cpp) at run time
+    if (section == "feel") continue;
     if (!section.empty() && key != "name" && key != "based_on" && key != "id") {
       const int field = StatField(key);
       const std::vector<int> slots = StatSlots(section);
@@ -1111,6 +1617,7 @@ std::string read_name(const fs::path& robot_txt, std::string* base = nullptr, St
       }
       continue;
     }
+    if (keys != nullptr && section.empty()) (*keys)[key] = value;
     if (key == "name") name = value;
     if (key == "id" && wanted_index != nullptr) {
       const int id = std::atoi(value.c_str());
@@ -1132,13 +1639,24 @@ std::string read_name(const fs::path& robot_txt, std::string* base = nullptr, St
   return clean.substr(0, 14);
 }
 
-std::vector<Robot> scan(const fs::path& mods, std::string& signature) {
+// Robot folders of the given places in order (the mods folder, then the
+// fighters the setup imported from another game): each folder a robot.
+std::vector<Robot> scan(const std::vector<fs::path>& places, std::string& signature) {
   std::vector<Robot> robots;
-  if (!fs::is_directory(mods)) return robots;
+  g_full_robot_indices.clear();
+  g_full_robot_hidden.clear();
+  g_full_robot_names.clear();
+  g_full_robot_folders.clear();
   std::vector<fs::path> folders;
-  for (auto& e : fs::directory_iterator(mods))
-    if (e.is_directory() && e.path().filename().string()[0] != '.') folders.push_back(e.path());
-  std::sort(folders.begin(), folders.end());
+  for (const fs::path& place : places) {
+    std::error_code ec;
+    if (!fs::is_directory(place, ec)) continue;
+    std::vector<fs::path> here;
+    for (auto& e : fs::directory_iterator(place, ec))
+      if (e.is_directory() && e.path().filename().string()[0] != '.') here.push_back(e.path());
+    std::sort(here.begin(), here.end());
+    folders.insert(folders.end(), here.begin(), here.end());
+  }
   for (const fs::path& folder : folders) {
     const fs::path robot_txt = folder / "robot.txt";
     if (!fs::is_regular_file(robot_txt)) {
@@ -1148,8 +1666,80 @@ std::vector<Robot> scan(const fs::path& mods, std::string& signature) {
     std::string base = "BASENJA";
     StatOverrides stats;
     int wanted_index = -1;
-    const std::string name = read_name(robot_txt, &base, &stats, &wanted_index);
+    std::map<std::string, std::string> keys;
+    const std::string name = read_name(robot_txt, &base, &stats, &wanted_index, &keys);
     if (base.empty()) base = "BASENJA";
+    if (keys.count("kind") && keys["kind"] == "full") {
+      // A full robot: robot.txt (name, robot, character, title, owner, sort,
+      // stat sections), character.bin (or character_02/12/22.bin), icons
+      // icon_0000/0001/0002.dds. Made by an importer from the player's own
+      // copy of another game; never part of a download.
+      Robot robot;
+      robot.full = true;
+      // registry = X: the robot's key in mods_registry.txt when its shown
+      // name is shared (a stage-only boosted copy of another robot)
+      robot.name = keys.count("registry") && !keys["registry"].empty() ? keys["registry"] : name;
+      robot.base = keys.count("based_on") ? base : "ATOM/MOVIE";
+      robot.stats = stats;
+      robot.wanted_index = wanted_index;
+      robot.robot_index = std::atoi(keys["robot"].c_str());
+      robot.character = std::atoi(keys["character"].c_str());
+      robot.sort = keys.count("sort") ? int(std::strtol(keys["sort"].c_str(), nullptr, 0)) : 0;
+      auto upper = [](std::string v) {
+        std::string out;
+        for (char c : v)
+          if (c >= 32 && c < 127) out.push_back(char(std::toupper(uint8_t(c))));
+        return out;
+      };
+      robot.select = !(keys.count("select") && keys["select"] == "0");
+      if (keys.count("stages")) {
+        std::istringstream in(keys["stages"]);
+        std::string tok;
+        while (in >> tok) {
+          int stage = 0, rank = 0;
+          if (std::sscanf(tok.c_str(), "%d:%d", &stage, &rank) == 2 && stage >= 4 && stage <= 9 && rank >= 1 && rank <= 4)
+            robot.stages.emplace_back(stage, rank);
+        }
+      }
+      for (int stage = 4; stage <= 9; ++stage) {
+        const std::string k = "stage_" + std::to_string(stage) + "_name";
+        if (keys.count(k)) robot.stage_names[stage] = upper(keys[k]).substr(0, 31);
+      }
+      robot.full_name = upper(keys["name"]).substr(0, 31);
+      robot.title = upper(keys["title"]).substr(0, 47);
+      robot.owner = keys["owner"].substr(0, 63);
+      if (name.empty() || !full_robot_slot_ok(robot.robot_index) || robot.character < 1 || robot.character > 999 ||
+          (!fs::is_regular_file(folder / "character.bin") && !fs::is_regular_file(folder / "character_02.bin"))) {
+        Notice(folder.filename().string() + " not loaded: a full robot needs name, robot (a free robot slot), character and character.bin");
+        continue;
+      }
+      if (std::find(g_full_robot_indices.begin(), g_full_robot_indices.end(), robot.robot_index) != g_full_robot_indices.end()) {
+        Notice(folder.string() + " not loaded: robot " + std::to_string(robot.robot_index) + " is already taken by another robot folder");
+        continue;
+      }
+      robot.models = folder;
+      std::string sig = name + " full robot " + std::to_string(robot.robot_index) + " character " + std::to_string(robot.character) +
+                        " sort " + std::to_string(robot.sort) + " " + robot.full_name + "|" + robot.title + "|" + robot.owner + "\n";
+      for (const auto& [slot, fields] : stats)
+        for (const auto& [field, value] : fields)
+          sig += "  stat " + std::to_string(slot) + ":" + std::to_string(field) + "=" + std::to_string(value) + "\n";
+      std::vector<fs::path> files;
+      for (auto& e : fs::directory_iterator(folder))
+        if (e.is_regular_file() && e.path().filename() != "robot.txt") files.push_back(e.path());
+      std::sort(files.begin(), files.end());
+      for (const fs::path& f : files) {
+        const auto t = static_cast<long long>(fs::last_write_time(f).time_since_epoch().count());
+        sig += f.filename().string() + " " + std::to_string(fs::file_size(f)) + " " + std::to_string(t) + "\n";
+      }
+      signature += sig;
+      robot.sig = sig;
+      g_full_robot_indices.push_back(robot.robot_index);
+      if (!robot.select) g_full_robot_hidden.push_back(robot.robot_index);
+      g_full_robot_names[robot.robot_index] = robot.full_name;
+      g_full_robot_folders[robot.robot_index] = folder;
+      robots.push_back(std::move(robot));
+      continue;
+    }
     // The robot's own files (OBJ / PNG, made into game files at install time),
     // or the built/ folder older mods came with.
     const fs::path built = folder / "built";
@@ -1401,7 +1991,7 @@ void check_robots(std::vector<Robot>& robots, const fs::path& root, const fs::pa
   std::vector<Robot> kept;
   for (Robot& robot : robots) {
     uint64_t hash = 1469598103934665603ull;
-    for (char c : robot.sig + stamp + " checks 1") hash = (hash ^ uint8_t(c)) * 1099511628211ull;
+    for (char c : robot.sig + stamp + " checks 2") hash = (hash ^ uint8_t(c)) * 1099511628211ull;
     char key[24];
     std::snprintf(key, sizeof(key), "%016llx", static_cast<unsigned long long>(hash));
     std::string result;
@@ -1414,10 +2004,18 @@ void check_robots(std::vector<Robot>& robots, const fs::path& root, const fs::pa
           tu = std::make_unique<Archive>(update_in / "pac" / "misc.pac");
           text = std::make_unique<Archive>(update_in / "pac" / "string.pac");
         }
-        const Base base = resolve_base(robot.base, *tu, *text);
-        for (int n = 1; n <= 7; ++n) {
-          if (!fs::is_regular_file(stock_archive_path(base.group, n, game, src)))
-            throw Failure("its base set " + robot.base + " needs add-on content (DLC) that is not installed");
+        if (robot.full) {
+          // a full robot needs the robot database, the select icons and a
+          // character pack in the newest official add-on package
+          for (const char* f : {"pac/ch/chEtc.pac", "pac/DLC_HD.pac", "pac/ch/ch100.pac"})
+            if (!fs::is_regular_file(src / f)) throw Failure(std::string("the official add-on content lacks ") + f);
+          if (robot.base != "ATOM/MOVIE") resolve_base(robot.base, *tu, *text);
+        } else {
+          const Base base = resolve_base(robot.base, *tu, *text);
+          for (int n = 1; n <= 7; ++n) {
+            if (!fs::is_regular_file(stock_archive_path(base.group, n, game, src)))
+              throw Failure("its base set " + robot.base + " needs add-on content (DLC) that is not installed");
+          }
         }
         if (robot.from_source) {
           RobotSource source(robot.models);
@@ -1454,6 +2052,42 @@ std::vector<std::string> Notices() {
   return g_notices;
 }
 
+std::vector<int> FullRobotIndices() { return g_full_robot_indices; }
+
+bool FullRobotHidden(int robot_index) {
+  return std::find(g_full_robot_hidden.begin(), g_full_robot_hidden.end(), robot_index) != g_full_robot_hidden.end();
+}
+
+std::vector<std::pair<int, std::string>> FullRobots() {
+  std::vector<std::pair<int, std::string>> out;
+  for (const auto& [index, name] : g_full_robot_names) out.emplace_back(index, name);
+  return out;
+}
+
+const std::vector<uint8_t>& FullRobotMotions() { return g_full_robot_motions; }
+
+bool FullRobotMotionAct(int robot_index, uint32_t act, uint32_t* own) {
+  const auto r = g_full_robot_motion_map.find(robot_index);
+  if (r == g_full_robot_motion_map.end() || act > 0xFFFF) return false;
+  const auto a = r->second.find(uint16_t(act));
+  if (a == r->second.end()) return false;
+  *own = a->second;
+  return true;
+}
+const std::vector<uint8_t>& FullRobotMotionEvents() { return g_full_robot_motion_events; }
+
+std::string FullRobotFolder(int robot_index) {
+  const auto it = g_full_robot_folders.find(robot_index);
+  return it == g_full_robot_folders.end() ? std::string() : it->second.string();
+}
+
+bool FullRobotParts(int robot_index, uint32_t ids[11]) {
+  const auto it = g_full_robot_parts.find(robot_index);
+  if (it == g_full_robot_parts.end()) return false;
+  for (int slot = 0; slot < 11; ++slot) ids[slot] = slot < int(it->second.size()) ? it->second[slot] : 0;
+  return true;
+}
+
 void InstallOnce(rex::PathConfig& paths);
 
 void Install(rex::PathConfig& paths) {
@@ -1474,12 +2108,12 @@ void InstallOnce(rex::PathConfig& paths) {
   try {
     const std::string dir = REXCVAR_GET(realsteel_mods_dir);
     const fs::path mods = dir.empty() ? exe_dir() / "mods" : fs::path(dir);
-    std::string signature = "loader 10 ";   // bump when the package layout changes
+    std::string signature = "loader 14 ";   // bump when the package layout changes (11: DLC stages 4-9)
     {
       std::lock_guard<std::mutex> lock(g_notice_mutex);
       g_notices.clear();
     }
-    std::vector<Robot> robots = scan(mods, signature);
+    std::vector<Robot> robots = scan({mods, paths.user_data_root / "imported"}, signature);
     const fs::path root = paths.user_data_root;
     if (!robots.empty()) {
       // The mod package is made from the newest official add-on package: no
@@ -1578,6 +2212,18 @@ void InstallOnce(rex::PathConfig& paths) {
       REXLOG_INFO("[mods] {} robot(s) from {} already installed", robots.size(), mods.string());
     }
     paths.update_data_root = update_out;
+    // full robots' own parts (their stats), for the part-list hook
+    g_full_robot_parts.clear();
+    const auto installed_ids = read_mod_ids(root / "mods_ids.txt");
+    for (const Robot& r : robots) {
+      if (!r.full || r.models.empty()) continue;
+      const auto it = installed_ids.find(r.name);
+      if (it != installed_ids.end()) g_full_robot_parts[r.robot_index] = it->second;
+    }
+    std::vector<const Robot*> full;
+    for (const Robot& r : robots)
+      if (r.full && !r.models.empty()) full.push_back(&r);
+    merge_full_robot_motions(full);
   } catch (const std::exception& e) {
     REXLOG_ERROR("[mods] not installed: {}", e.what());
   }

@@ -164,6 +164,7 @@ NativeSocket g_socket = kNoSocket;
 uint16_t g_real_port = 0;
 uint32_t g_self_ip = 0;                      // guest address, host byte order
 std::map<uint32_t, Endpoint> g_peers;        // guest address -> real endpoint
+std::atomic<int64_t> g_last_peer_send{0};    // steady_clock ns of the last game packet to a peer
 std::map<uint32_t, Advert> g_adverts;        // by host guest address
 std::deque<Datagram> g_inbox;
 bool g_started = false;
@@ -836,6 +837,12 @@ void SetModsSignature(const std::string& signature) {
 
 std::string OnlineName() { return PlayerName(); }
 
+bool InMatch() {
+  const int64_t last = g_last_peer_send.load();
+  return last != 0 && std::chrono::steady_clock::now().time_since_epoch().count() - last <
+                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5)).count();
+}
+
 uint16_t ServicePort() {
   std::lock_guard<std::mutex> lock(g_mutex);
   return g_real_port != 0 ? g_real_port : uint16_t(REXCVAR_GET(realsteel_net_port));
@@ -1078,6 +1085,7 @@ extern "C" REX_FUNC(sub_82333610) {
                 peer != g_peers.end() ? "known peer" : "unknown address, dropped");
   }
   if (peer != g_peers.end()) {
+    g_last_peer_send.store(std::chrono::steady_clock::now().time_since_epoch().count());
     std::vector<uint8_t> packet = Header(kData);
     Put16(packet, s->port);
     Put16(packet, to_port);

@@ -230,6 +230,7 @@ set(REALSTEEL_SOURCES
     src/realsteel_native_settings.cpp
     src/realsteel_aspect.cpp
     src/realsteel_hooks.cpp
+    src/realsteel_robots.cpp
     src/realsteel_keyboard.cpp
     src/realsteel_host_window.cpp
     src/realsteel_native_present.cpp

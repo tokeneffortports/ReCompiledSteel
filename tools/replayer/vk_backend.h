@@ -70,6 +70,7 @@ struct RenderOptions {
   float sharpen = 0.0f;
   // FXAA in the present pass (source texels), 2026-10-12.
   bool fxaa = false;
+  float ao_strength = 0.0f;  // ambient occlusion: 0 = off (the original picture), up to 1
   // HDR output (2026-10-12): an HDR10 (PQ) or scRGB swapchain where the
   // surface offers one; the SDR picture is expanded in the present pass
   // (paper white for everyday content, highlights up to the peak).
@@ -268,6 +269,9 @@ class Renderer {
   // Low-end settings (RenderOptions::no_crowd / half_textures); changing the
   // texture setting reloads the textures at the next frame.
   void SetLowEnd(bool crowd, bool half_textures);
+  void ReloadTextures();  // every game texture is decoded again (texture pack on / off)
+  void SetAmbientOcclusion(float strength);  // 0 = off
+  void SetCamera(float fov_y, float near_z, float far_z);  // the game's main camera, for effects
   // Android pre-rotation on/off (RenderOptions::prerotate); rebuilds the
   // swapchain at the next frame.
   void SetPrerotate(bool on);

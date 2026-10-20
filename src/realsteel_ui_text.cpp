@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -41,6 +42,7 @@ std::map<uint32_t, uint32_t> g_slot;      // id -> slot index
 uint32_t g_pool = 0;                      // guest address of the slots
 uint32_t g_next_slot = 0;
 bool g_dirty = false;
+std::atomic<int> g_chosen_stage{-1};    // stage record of the last stage-menu choice
 uint8_t* g_base = nullptr;                // guest memory base, from the hook
 std::vector<std::pair<uint32_t, uint32_t>> g_pinned;  // [first, end) ranges
 
@@ -91,6 +93,15 @@ using namespace realsteel::ui_text;
 namespace {
 // Override for |id| into ctx.r3, or false (the game's own lookup runs).
 bool Lookup(PPCContext& ctx, uint8_t* base, void (*original)(PPCContext&, uint8_t*)) {
+  // 2026-10-17: the pre-fight screen's stage title (sub_82409B48, return
+  // 0x82409DA0) asks for strings 205 + DLC stage - 1 but stops at DLC stage
+  // 3, the last the official add-ons have. For DLC stages 4-9 (the mod
+  // loader's, stage records 9-14 as last chosen in the stage menu, see the
+  // sub_82157790 hook) it gets that stage's own string instead.
+  if (uint32_t(ctx.lr) == 0x82409DA0u && ctx.r4.u32 >= 205 && ctx.r4.u32 <= 213) {
+    const int record = g_chosen_stage.load();
+    if (record >= 9 && record <= 14) ctx.r4.u32 = uint32_t(205 + (record - 6));
+  }
   const uint32_t id = ctx.r4.u32;
   g_base = base;
   // Development: "uitext.trigger" (with --realsteel_dev_triggers) holds
@@ -194,4 +205,11 @@ extern "C" REX_FUNC(sub_82083638) {
 }
 extern "C" REX_FUNC(sub_82098EA8) {
   if (!Lookup(ctx, base, __imp__sub_82098EA8)) __imp__sub_82098EA8(ctx, base);
+}
+
+// Stage menu item -> stage record (0-4 main stages, 6-14 DLC stages 1-9,
+// 15 free fight, 16 the DLC submenu). Remembered for the stage title above.
+extern "C" REX_FUNC(sub_82157790) {
+  __imp__sub_82157790(ctx, base);
+  realsteel::ui_text::g_chosen_stage.store(int(ctx.r3.u32));
 }

@@ -317,6 +317,21 @@ class Backend {
   VkDescriptorSet present_set_ = VK_NULL_HANDLE;
   VkPipelineLayout present_layout_ = VK_NULL_HANDLE;
   VkPipeline present_pipeline_ = VK_NULL_HANDLE;
+  // Ambient occlusion pass (RunAmbientOcclusion).
+  bool EnsureAoResources(VkFormat color_format);
+  VkDescriptorSetLayout ao_dsl_ = VK_NULL_HANDLE;
+  VkDescriptorPool ao_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet ao_set_ = VK_NULL_HANDLE;
+  VkPipelineLayout ao_layout_ = VK_NULL_HANDLE;
+  VkPipeline ao_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline ao_blur_pipeline_ = VK_NULL_HANDLE;
+  VkImage ao_image_ = VK_NULL_HANDLE;  // the occlusion, R8
+  VkDeviceMemory ao_image_mem_ = VK_NULL_HANDLE;
+  VkImageView ao_image_view_ = VK_NULL_HANDLE;
+  uint32_t ao_image_w_ = 0, ao_image_h_ = 0;
+  VkFormat ao_pipeline_format_ = VK_FORMAT_UNDEFINED;
+  VkImageView ao_bound_view_ = VK_NULL_HANDLE;
+  float camera_fov_y_ = 0.64f, camera_near_ = 1.0f, camera_far_ = 30000.0f;
   VkFormat present_pipeline_format_ = VK_FORMAT_UNDEFINED;
   bool present_src_written_ = false;  // present_set_ points at present_src_
   bool EnsurePresentResources();
@@ -564,6 +579,15 @@ class Backend {
       swapchain_dirty_ = true;
     }
   }
+  void ReloadTextures() { texture_reload_ = true; }  // e.g. a texture pack switched on / off
+  void SetAmbientOcclusion(float strength) { options_.ao_strength = std::max(0.0f, std::min(1.0f, strength)); }
+  void SetCamera(float fov_y, float near_z, float far_z) {
+    if (fov_y > 0.05f && fov_y < 3.0f && near_z > 0.0f && far_z > near_z) {
+      camera_fov_y_ = fov_y;
+      camera_near_ = near_z;
+      camera_far_ = far_z;
+    }
+  }
   void SetLowEnd(bool crowd, bool half_textures) {
     options_.no_crowd = !crowd;
     if (half_textures != options_.half_textures) {
@@ -712,6 +736,7 @@ class Backend {
   VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet sets_[4] = {};
   VkSampler sampler_ = VK_NULL_HANDLE;
+  VkSampler extra_samplers_[8] = {};  // sampler set entries 1-8 (CreateTextureSampler)
   float max_anisotropy_ = 1.0f;       // device limit; 1 = unsupported
   uint32_t sampler_anisotropy_ = 1;   // what sampler_ was created with
   bool CreateTextureSampler();
@@ -854,6 +879,7 @@ class Backend {
     retired_images_.clear();
   }
 
+  void RunAmbientOcclusion(RtEntry* rt);  // (defined with EnsureAoResources)
   RtEntry* GetRt(uint64_t key, uint32_t need_w = kAttachW,
                  uint32_t need_h = kAttachH);
 };
@@ -963,8 +989,8 @@ Backend::RtEntry* Backend::GetRt(uint64_t key, uint32_t need_w, uint32_t need_h)
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                   &entry.color, &entry.color_mem) ||
       !AllocImage(device_, phys_, SW(w), SH(h), VK_FORMAT_D32_SFLOAT,
-                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, &entry.depth,
-                  &entry.depth_mem)) {
+                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  &entry.depth, &entry.depth_mem)) {
     return nullptr;
   }
   VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1222,13 +1248,35 @@ bool Backend::InitVulkan(bool validation) {
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     p2.pNext = &drv;
     vkGetPhysicalDeviceProperties2(phys_, &p2);
-    char text[512];
+    // A custom driver that fails to load (a missing companion library, say)
+    // is quietly replaced by the system driver inside libadrenotools: only
+    // call it custom when its file is really mapped into the process
+    // (2026-10-16, a Qualcomm driver package on an Adreno 725).
+    const char* custom_note = "";
+    if (g_custom_loader != nullptr) {
+      custom_note = " - CUSTOM DRIVER";
+#ifdef __ANDROID__
+      if (const char* chosen = std::getenv("REALSTEEL_GPU_DRIVER"); chosen != nullptr && *chosen != 0) {
+        const std::string file = std::filesystem::path(chosen).filename().string();
+        bool mapped = false;
+        if (FILE* maps = std::fopen("/proc/self/maps", "r")) {
+          char line[1024];
+          while (!mapped && std::fgets(line, sizeof(line), maps) != nullptr) mapped = std::strstr(line, file.c_str()) != nullptr;
+          std::fclose(maps);
+        }
+        if (!mapped) {
+          custom_note = " - the CUSTOM DRIVER FAILED TO LOAD, this is the system driver (see hook_impl in the logcat)";
+        }
+      }
+#endif
+    }
+    char text[640];
     std::snprintf(text, sizeof(text),
                   "%s, driver %s [%s] (id %d, version 0x%08x, Vulkan %u.%u.%u)%s",
                   props.deviceName, drv.driverName, drv.driverInfo, int(drv.driverID),
                   props.driverVersion, VK_API_VERSION_MAJOR(props.apiVersion),
                   VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion),
-                  g_custom_loader != nullptr ? " - CUSTOM DRIVER" : "");
+                  custom_note);
     // (Qualcomm's driverInfo is several lines: keep the log line whole.)
     for (char* c = text; *c != 0; ++c) {
       if (*c == '\n' || *c == '\r') *c = ' ';
@@ -1973,6 +2021,21 @@ uint32_t Backend::UploadDecoded(uint32_t phys, const DecodedTexture& full) {
   // Stage pixels in the arena and record the copy into the setup command
   // buffer (already recording during texture upload phase). Layers are
   // packed back to back, which is what a tightly packed buffer copy expects.
+  // 2026-10-18: textures leave a quarter of the arena to the frame's own
+  // vertex / constant data - a burst of big texture-pack textures filled it
+  // and the frame's draws then read outside it (device lost). A texture
+  // that does not fit waits a frame (white for that frame; the arena grows).
+  if (arena_used_ + tex.rgba.size() + 16 > arena_bytes_ - arena_bytes_ / 4) {
+    if (!arena_grow_) {
+      std::printf("[vk] texture uploads deferred to the next frame (upload buffer %.0f MB)\n",
+                  double(arena_bytes_) / 1048576.0);
+    }
+    arena_grow_ = true;
+    vkDestroyImageView(device_, view, nullptr);
+    vkDestroyImage(device_, image, nullptr);
+    vkFreeMemory(device_, memory, nullptr);
+    return 0;
+  }
   const VkDeviceSize at = Alloc(tex.rgba.size(), 16);
   if (at == VkDeviceSize(-1)) return 0;
   std::memcpy(arena_ptr_ + at, tex.rgba.data(), tex.rgba.size());
@@ -2801,6 +2864,7 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
   uint32_t vp_x = 0, vp_y = 0, vp_w = kWidth, vp_h = kHeight;
   uint64_t cur_key = 0;  // guest RT surface ptr; 0 = boot default
   RtEntry* final_rt = GetRt(0);
+  bool ao_done = false;  // ambient occlusion ran this frame
   RtEntry* cur_rt = final_rt;
   RtEntry* last_draw_rt = final_rt;  // presented surface = last drawn into
   if (final_rt == nullptr) return false;
@@ -3762,7 +3826,17 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
       shared[kSharedCubeBase / 4 + s] =
           (!options_.all_white && cube != cube_indices_.end()) ? cube->second
                                                                : 0;
-      shared[kSharedSamplerBase / 4 + s] = 0;
+      {
+        // Clamp modes (texture_fmt bits 16-21, Xenos ClampMode): 0 repeat,
+        // 1 mirrored repeat, 2-7 clamp variants (approximated as clamp to
+        // edge). 2026-10-18: everything was repeat - the dialog buttons'
+        // nine-slice pieces sampled their opposite edge at the seams (the
+        // 1-px line 7 px above their bottom).
+        const auto cls = [](uint32_t m) { return m == 0 ? 0u : m == 1 ? 1u : 2u; };
+        const uint32_t cx = (d.texture_fmt[s] >> 16) & 0x7u;
+        const uint32_t cy = (d.texture_fmt[s] >> 19) & 0x7u;
+        shared[kSharedSamplerBase / 4 + s] = cls(cx) * 3u + cls(cy);
+      }
     }
     // Bool constants (offset 320 in SharedConstants layout v2).
     if (d.bool_bank_offset != kInvalidPayloadOffset &&
@@ -4032,6 +4106,12 @@ bool Backend::RenderFrame(const FrameData& frame, std::vector<uint8_t>& rgba,
     if (pending_clear && !rendering_active) begin_pass();
     end_pass();
     pass_resumable = true;
+    // Ambient occlusion (option): once a frame, on the 3D scene, before the
+    // game's first copy of it.
+    if (options_.ao_strength > 0.0f && frame_is_scene_ && !ao_done && cur_rt == final_rt) {
+      ao_done = true;
+      RunAmbientOcclusion(cur_rt);
+    }
         const uint32_t dst_w = (r.fetch[2] & 0x1FFF) + 1;
         const uint32_t dst_h = ((r.fetch[2] >> 13) & 0x1FFF) + 1;
         // Shadow maps (small targets / float format): our passes lack the
@@ -4962,6 +5042,10 @@ Backend::~Backend() {
     }
     if (pipeline_layout_) vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
     if (sampler_) vkDestroySampler(device_, sampler_, nullptr);
+    for (VkSampler& x : extra_samplers_) {
+      if (x) vkDestroySampler(device_, x, nullptr);
+      x = VK_NULL_HANDLE;
+    }
     if (desc_pool_) vkDestroyDescriptorPool(device_, desc_pool_, nullptr);
     for (VkDescriptorSetLayout l : set_layouts_) {
       if (l) vkDestroyDescriptorSetLayout(device_, l, nullptr);
@@ -5330,6 +5414,298 @@ bool Backend::CreateSwapchain() {
   return true;
 }
 
+// Ambient occlusion (2026-10-18, off by default): see ao_shaders.hlsl. Two
+// passes once a frame, just before the game first copies the 3D scene
+// (RenderFrame's do_resolve): the occlusion from the main surface's depth
+// into ao_image_, then a depth-aware blur of it multiplied into the colour.
+bool Backend::EnsureAoResources(VkFormat color_format) {
+  if (ao_dsl_ == VK_NULL_HANDLE) {
+    VkDescriptorSetLayoutBinding b[2] = {};
+    for (uint32_t i = 0; i < 2; ++i) {
+      b[i].binding = i;  // 0 depth, 1 occlusion (blur pass)
+      b[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      b[i].descriptorCount = 1;
+      b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dli.bindingCount = 2;
+    dli.pBindings = b;
+    VK_CHECK(vkCreateDescriptorSetLayout(device_, &dli, nullptr, &ao_dsl_));
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &ps;
+    VK_CHECK(vkCreateDescriptorPool(device_, &dpi, nullptr, &ao_pool_));
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = ao_pool_;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &ao_dsl_;
+    VK_CHECK(vkAllocateDescriptorSets(device_, &dai, &ao_set_));
+    VkPushConstantRange range{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &ao_dsl_;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    VK_CHECK(vkCreatePipelineLayout(device_, &pli, nullptr, &ao_layout_));
+  }
+  // The occlusion image: one channel, the size of the frame area.
+  const uint32_t w = SW(kWidth), h = SH(kHeight);
+  if (ao_image_ != VK_NULL_HANDLE && (ao_image_w_ != w || ao_image_h_ != h)) {
+    WaitFlight();
+    vkDestroyImageView(device_, ao_image_view_, nullptr);
+    vkDestroyImage(device_, ao_image_, nullptr);
+    vkFreeMemory(device_, ao_image_mem_, nullptr);
+    ao_image_view_ = VK_NULL_HANDLE;
+    ao_image_ = VK_NULL_HANDLE;
+    ao_image_mem_ = VK_NULL_HANDLE;
+    ao_bound_view_ = VK_NULL_HANDLE;
+  }
+  if (ao_image_ == VK_NULL_HANDLE) {
+    if (!AllocImage(device_, phys_, w, h, VK_FORMAT_R8_UNORM,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &ao_image_,
+                    &ao_image_mem_)) {
+      ao_image_ = VK_NULL_HANDLE;
+      return false;
+    }
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.image = ao_image_;
+    vci.format = VK_FORMAT_R8_UNORM;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device_, &vci, nullptr, &ao_image_view_));
+    ao_image_w_ = w;
+    ao_image_h_ = h;
+    ao_bound_view_ = VK_NULL_HANDLE;  // binding 1 needs writing
+  }
+  if (ao_pipeline_ != VK_NULL_HANDLE && ao_pipeline_format_ == color_format) return true;
+  if (ao_pipeline_ != VK_NULL_HANDLE) {
+    WaitFlight();
+    vkDestroyPipeline(device_, ao_pipeline_, nullptr);
+    vkDestroyPipeline(device_, ao_blur_pipeline_, nullptr);
+    ao_pipeline_ = ao_blur_pipeline_ = VK_NULL_HANDLE;
+  }
+  VkShaderModule mods[3] = {};
+  VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  mci.codeSize = sizeof(kAoVSSpv);
+  mci.pCode = kAoVSSpv;
+  VK_CHECK(vkCreateShaderModule(device_, &mci, nullptr, &mods[0]));
+  mci.codeSize = sizeof(kAoPSSpv);
+  mci.pCode = kAoPSSpv;
+  VK_CHECK(vkCreateShaderModule(device_, &mci, nullptr, &mods[1]));
+  mci.codeSize = sizeof(kAoBlurPSSpv);
+  mci.pCode = kAoBlurPSSpv;
+  VK_CHECK(vkCreateShaderModule(device_, &mci, nullptr, &mods[2]));
+  VkPipelineShaderStageCreateInfo st[2] = {};
+  st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  st[0].module = mods[0];
+  st[0].pName = "vs_main";
+  st[1] = st[0];
+  st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vp.viewportCount = 1;
+  vp.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.cullMode = VK_CULL_MODE_NONE;
+  rs.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState att{};
+  att.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cb.attachmentCount = 1;
+  cb.pAttachments = &att;
+  const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  ds.dynamicStateCount = 2;
+  ds.pDynamicStates = dyn;
+  VkFormat format = VK_FORMAT_R8_UNORM;
+  VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachmentFormats = &format;
+  VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  pci.pNext = &ri;
+  pci.stageCount = 2;
+  pci.pStages = st;
+  pci.pVertexInputState = &vi;
+  pci.pInputAssemblyState = &ia;
+  pci.pViewportState = &vp;
+  pci.pRasterizationState = &rs;
+  pci.pMultisampleState = &ms;
+  pci.pColorBlendState = &cb;
+  pci.pDynamicState = &ds;
+  pci.layout = ao_layout_;
+  // Pass 1: occlusion into ao_image_, written as is.
+  st[1].module = mods[1];
+  st[1].pName = "ps_main";
+  VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &ao_pipeline_);
+  // Pass 2: colour x blurred factor; alpha kept (the title's composite reads it).
+  if (r == VK_SUCCESS) {
+    st[1].module = mods[2];
+    st[1].pName = "ps_blur";
+    format = color_format;
+    att.blendEnable = VK_TRUE;
+    att.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
+    att.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    att.colorBlendOp = VK_BLEND_OP_ADD;
+    att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    att.alphaBlendOp = VK_BLEND_OP_ADD;
+    r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &ao_blur_pipeline_);
+  }
+  for (VkShaderModule m : mods) vkDestroyShaderModule(device_, m, nullptr);
+  if (r != VK_SUCCESS) {
+    std::printf("[vk] ambient occlusion pipeline creation failed: %d\n", int(r));
+    if (ao_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device_, ao_pipeline_, nullptr);
+    ao_pipeline_ = ao_blur_pipeline_ = VK_NULL_HANDLE;
+    return false;
+  }
+  ao_pipeline_format_ = color_format;
+  return true;
+}
+
+void Backend::RunAmbientOcclusion(RtEntry* rt) {
+  if (rt == nullptr || rt->depth == VK_NULL_HANDLE || !rt->depth_ready) return;
+  if (!EnsureAoResources(VK_FORMAT_R8G8B8A8_UNORM)) return;
+  if (ao_bound_view_ != rt->depth_view) {
+    WaitFlight();  // the set may be in use by the frame in flight
+    VkDescriptorImageInfo img[2] = {};
+    img[0].imageView = rt->depth_view;
+    img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[1].imageView = ao_image_view_;
+    img[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wr.dstSet = ao_set_;
+    wr.dstBinding = 0;
+    wr.descriptorCount = 2;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    wr.pImageInfo = img;
+    vkUpdateDescriptorSets(device_, 1, &wr, 0, nullptr);
+    ao_bound_view_ = rt->depth_view;
+  }
+  // Depth -> sampled, occlusion image -> attachment.
+  VkImageMemoryBarrier2 b[2] = {};
+  b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  b[0].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  b[0].srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+  b[0].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  b[0].dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  b[0].oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  b[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  b[0].image = rt->depth;
+  b[0].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+  b[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  b[1].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  b[1].srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  b[1].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+  b[1].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+  b[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // fully rewritten
+  b[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  b[1].image = ao_image_;
+  b[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dep.imageMemoryBarrierCount = 2;
+  dep.pImageMemoryBarriers = b;
+  vkCmdPipelineBarrier2(cmd_, &dep);
+
+  const uint32_t w = SW(kWidth), h = SH(kHeight);
+  const VkViewport viewport{0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
+  const VkRect2D scissor{{0, 0}, {w, h}};
+  struct {
+    float near_z, far_z, tan_y, tan_x, size_x, size_y, radius, strength;
+  } push;
+  push.near_z = camera_near_;
+  push.far_z = camera_far_;
+  push.tan_y = std::tan(camera_fov_y_ * 0.5f);
+  // The game's 16:9 projection; other picture shapes stretch it.
+  push.tan_x = push.tan_y * 16.0f / 9.0f;
+  push.size_x = float(w);
+  push.size_y = float(h);
+  push.radius = 60.0f;
+  push.strength = options_.ao_strength;
+
+  VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  color.imageView = ao_image_view_;
+  color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea = {{0, 0}, {w, h}};
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &color;
+  vkCmdBeginRendering(cmd_, &ri);
+  vkCmdSetViewport(cmd_, 0, 1, &viewport);
+  vkCmdSetScissor(cmd_, 0, 1, &scissor);
+  vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_pipeline_);
+  vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_layout_, 0, 1, &ao_set_, 0, nullptr);
+  vkCmdPushConstants(cmd_, ao_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+  vkCmdDraw(cmd_, 3, 1, 0, 0);
+  vkCmdEndRendering(cmd_);
+
+  // Occlusion image -> sampled, main surface -> attachment.
+  b[0] = {};
+  b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  b[0].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+  b[0].srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+  b[0].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  b[0].dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  b[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  b[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  b[0].image = ao_image_;
+  b[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  b[1] = {};
+  b[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  b[1].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  b[1].srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+  b[1].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+  b[1].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+  b[1].oldLayout = rt->layout;
+  b[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  b[1].image = rt->color;
+  b[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier2(cmd_, &dep);
+  rt->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  color.imageView = rt->color_view;
+  color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  vkCmdBeginRendering(cmd_, &ri);
+  vkCmdSetViewport(cmd_, 0, 1, &viewport);
+  vkCmdSetScissor(cmd_, 0, 1, &scissor);
+  vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_blur_pipeline_);
+  vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, ao_layout_, 0, 1, &ao_set_, 0, nullptr);
+  vkCmdPushConstants(cmd_, ao_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+  vkCmdDraw(cmd_, 3, 1, 0, 0);
+  vkCmdEndRendering(cmd_);
+
+  VkImageMemoryBarrier2 back{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+  back.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  back.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  back.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_2_COPY_BIT;
+  back.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+  back.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  back.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  back.image = rt->depth;
+  back.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+  VkDependencyInfo dep2{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dep2.imageMemoryBarrierCount = 1;
+  dep2.pImageMemoryBarriers = &back;
+  vkCmdPipelineBarrier2(cmd_, &dep2);
+  // The game's draws rely on the global sets bound once at the frame's start
+  // (texture heaps, samplers, constants): these passes replaced set 0 - bind
+  // them again.
+  vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 4, sets_, 0, nullptr);
+  vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 4, 1, &cset_, 0, nullptr);
+}
+
 bool Backend::EnsurePresentResources() {
   if (present_src_ == VK_NULL_HANDLE) {
     if (!AllocImage(device_, phys_, SW(kWidth), SH(kHeight), VK_FORMAT_R8G8B8A8_UNORM,
@@ -5491,30 +5867,38 @@ bool Backend::CreateTextureSampler() {
   WaitFlight();  // the old sampler / the set may be in use by the frame in flight
   const float aniso = std::min(max_anisotropy_,
                                float(std::max(1u, options_.anisotropy)));
-  VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-  sci.magFilter = VK_FILTER_LINEAR;
-  sci.minFilter = VK_FILTER_LINEAR;
-  sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-  sci.maxLod = VK_LOD_CLAMP_NONE;
-  sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  sci.anisotropyEnable = aniso > 1.0f ? VK_TRUE : VK_FALSE;
-  sci.maxAnisotropy = aniso;
-  VkSampler sampler = VK_NULL_HANDLE;
-  VK_CHECK(vkCreateSampler(device_, &sci, nullptr, &sampler));
-  VkDescriptorImageInfo sampler_info{};
-  sampler_info.sampler = sampler;
-  VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-  write.dstSet = sets_[3];
-  write.dstBinding = 0;
-  write.dstArrayElement = 0;
-  write.descriptorCount = 1;
-  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-  write.pImageInfo = &sampler_info;
-  vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-  if (sampler_ != VK_NULL_HANDLE) vkDestroySampler(device_, sampler_, nullptr);
-  sampler_ = sampler;
+  // Sampler i = U mode (i / 3) x V mode (i % 3): repeat, mirror, clamp - the
+  // fetch constant's clamp_x / clamp_y (as in Pacific Rim's renderer).
+  static const VkSamplerAddressMode kModes[3] = {VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                                                 VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+                                                 VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+  for (uint32_t i = 0; i < 9; ++i) {
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.maxLod = VK_LOD_CLAMP_NONE;
+    sci.addressModeU = kModes[i / 3];
+    sci.addressModeV = kModes[i % 3];
+    sci.addressModeW = kModes[i % 3];
+    sci.anisotropyEnable = aniso > 1.0f ? VK_TRUE : VK_FALSE;
+    sci.maxAnisotropy = aniso;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateSampler(device_, &sci, nullptr, &sampler));
+    VkDescriptorImageInfo sampler_info{};
+    sampler_info.sampler = sampler;
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = sets_[3];
+    write.dstBinding = 0;
+    write.dstArrayElement = i;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    write.pImageInfo = &sampler_info;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    VkSampler& slot = i == 0 ? sampler_ : extra_samplers_[i - 1];
+    if (slot != VK_NULL_HANDLE) vkDestroySampler(device_, slot, nullptr);
+    slot = sampler;
+  }
   sampler_anisotropy_ = options_.anisotropy;
   return true;
 }
@@ -5841,6 +6225,11 @@ void Renderer::SetLiveOptions(uint32_t internal_width, uint32_t internal_height,
 }
 void Renderer::SetVsync(bool vsync) { AsBackend(backend_)->SetVsync(vsync); }
 void Renderer::SetPrerotate(bool on) { AsBackend(backend_)->SetPrerotate(on); }
+void Renderer::ReloadTextures() { AsBackend(backend_)->ReloadTextures(); }
+void Renderer::SetAmbientOcclusion(float strength) { AsBackend(backend_)->SetAmbientOcclusion(strength); }
+void Renderer::SetCamera(float fov_y, float near_z, float far_z) {
+  AsBackend(backend_)->SetCamera(fov_y, near_z, far_z);
+}
 void Renderer::SetLowEnd(bool crowd, bool half_textures) {
   AsBackend(backend_)->SetLowEnd(crowd, half_textures);
 }

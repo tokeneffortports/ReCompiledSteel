@@ -83,9 +83,8 @@ std::string PickFile(Tool tool, const std::string& title, bool folder, const std
 int RunWithDialogs(Tool tool, Args args) {
   const std::string title = "ReCompiled Steel setup";
   Message(tool, title,
-          "This copies your own Real Steel files from your Xbox 360 into the game folder.\n\n"
-          "On the console they are under Content/0000000000000000/584111E0/\n"
-          "(000D0000 = the game, 000B0000 = the title update, 00000002 = add-ons).\n\n"
+          "This copies your own Real Steel files from your Xbox 360 into the game folder:\n"
+          "the game, its title update (required) and any add-ons.\n\n"
           "Next: pick the folder you copied them to (everything in it is found automatically).");
   std::string home = std::getenv("HOME") ? std::getenv("HOME") : ".";
   Plan plan;
@@ -156,6 +155,8 @@ int main(int argc, char** argv) {
     std::printf("%s", Usage().c_str());
     return args.help ? 0 : 2;
   }
+  // only importing fighters from another game (Real Steel already installed)
+  if (!args.fighters.empty() && args.game.empty() && args.scan.empty()) return RunImportConsole(args);
   const bool interactive = args.game.empty() && args.scan.empty();
   if (!args.cli && interactive) {
     const Tool tool = FindTool();
@@ -174,5 +175,7 @@ int main(int argc, char** argv) {
     std::printf("%s\n", error.c_str());
     return 1;
   }
-  return RunConsole(plan);
+  const int code = RunConsole(plan);
+  if (code != 0 || args.fighters.empty()) return code;
+  return RunImportConsole(args);
 }

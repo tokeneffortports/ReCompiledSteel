@@ -48,6 +48,7 @@ import java.util.Map;
 public class LauncherActivity extends Activity {
     private static final int PICK_FOLDER = 1;
     private static final int PICK_DRIVER = 2;
+    private static final int PICK_FIGHTERS = 3;
 
     private static final int BACKGROUND = Color.rgb(12, 16, 20);
     private static final int CARD = Color.rgb(22, 28, 34);
@@ -66,6 +67,7 @@ public class LauncherActivity extends Activity {
     private ProgressBar progress;
     private Button start;
     private Button install;
+    private Button fighters;
     private Button access;
     private String crashNote = "";
     private boolean installing;
@@ -143,6 +145,7 @@ public class LauncherActivity extends Activity {
         access = addButton(buttons, "Allow file access", true, v -> askFileAccess());
         start = addButton(buttons, "Start", true, v -> startGame());
         install = addButton(buttons, "Install game files", false, v -> pickFolder());
+        fighters = addButton(buttons, "Import fighters", false, v -> pickFightersFolder());
         addButton(buttons, "Graphics driver", false, v -> driverMenu());
         addButton(buttons, "Save diagnostics", false, v -> {
             File saved = RunState.saveDiagnostics(this, "diagnostics");
@@ -307,6 +310,10 @@ public class LauncherActivity extends Activity {
             line(text, update ? GOOD : (game ? BAD : MUTED), "Title update",
                  update ? "installed" : "not installed (required)");
             line(text, addons > 0 ? GOOD : MUTED, "Add-ons", addons > 0 ? addons + " installed" : "none (optional)");
+            File[] imported = new File(root, "user/imported").listFiles(File::isDirectory);
+            int count = imported != null ? imported.length : 0;
+            line(text, count > 0 ? GOOD : MUTED, "Imported fighters",
+                 count > 0 ? count + " (from another Yuke's game)" : "none (optional - \"Import fighters\")");
         }
         boolean custom = GpuDriver.selected(this) != null;
         line(text, custom ? WARN : MUTED, "Graphics driver",
@@ -322,6 +329,7 @@ public class LauncherActivity extends Activity {
         start.setEnabled(!installing && canRead && game && update);
         install.setEnabled(!installing && canRead);
         install.setText(game && update ? "Reinstall game files" : "Install game files");
+        fighters.setEnabled(!installing && canRead && game && update);
     }
 
     private void askFileAccess() {
@@ -365,6 +373,87 @@ public class LauncherActivity extends Activity {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    // ------------------------------------------------- fighters from another game
+
+    /** Optional: the robot fighters of another Yuke's Xbox 360 game (the player's own packages). */
+    private void pickFightersFolder() {
+        crashNote = "";
+        message.setText("Pick the folder that holds the Xbox 360 packages of another Yuke's game "
+                        + "(your own copy, with its add-ons if you have them). Its robot fighters are "
+                        + "imported into character select. Supported so far: Pacific Rim.");
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        try {
+            startActivityForResult(intent, PICK_FIGHTERS);
+        } catch (Exception e) {
+            message.setText("This device has no folder picker: " + e.getMessage());
+        }
+    }
+
+    private void confirmFighters(String folder, Map<String, String> found) {
+        String game = found.getOrDefault("game", "");
+        String names = found.getOrDefault("fighters", "");
+        if (game.isEmpty() || names.isEmpty()) {
+            message.setText("No supported game was found in " + folder + ". Pick the folder holding its "
+                            + "Xbox 360 packages, as copied from your console.");
+            return;
+        }
+        message.setText("");
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Import fighters")
+            .setMessage("Found " + game + ":\n\n• " + names.replace("|", "\n• ")
+                        + "\n\nImport them? They appear in character select.")
+            .setPositiveButton("Import", (d, w) -> runFighters(folder))
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void runFighters(String folder) {
+        installing = true;
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        progress.setProgress(0);
+        progress.setVisibility(View.VISIBLE);
+        message.setText("Importing...");
+        refresh();
+        File root = RunState.dataRoot();
+        ArrayDeque<String> lines = new ArrayDeque<>();
+        new Thread(() -> {
+            String error = Installer.runFighters(folder, new File(root, "game").getAbsolutePath(),
+                new File(root, "user").getAbsolutePath(), new Installer.Listener() {
+                    @Override
+                    public void onProgress(double fraction, String what) {
+                        runOnUiThread(() -> {
+                            progress.setProgress((int) (fraction * 1000));
+                            message.setText(what + " ... " + (int) (fraction * 100) + "%");
+                        });
+                    }
+
+                    @Override
+                    public void onLog(String line) {
+                        synchronized (lines) {
+                            lines.addLast(line);
+                            while (lines.size() > 6) lines.removeFirst();
+                        }
+                    }
+                });
+            runOnUiThread(() -> {
+                installing = false;
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                progress.setVisibility(View.GONE);
+                refresh();
+                if (error.isEmpty()) {
+                    message.setText("Imported. The fighters are in character select.");
+                    start.requestFocus();
+                } else {
+                    StringBuilder text = new StringBuilder("The import stopped: ").append(error);
+                    synchronized (lines) {
+                        for (String l : lines) text.append("\n").append(l);
+                    }
+                    message.setText(text.toString());
+                }
+            });
+        }, "RS fighters").start();
     }
 
     // --------------------------------------------------------- graphics driver
@@ -445,6 +534,24 @@ public class LauncherActivity extends Activity {
             }, "RS driver").start();
             return;
         }
+        if (requestCode == PICK_FIGHTERS) {
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+                message.setText("");
+                return;
+            }
+            String folder = treeToPath(data.getData());
+            if (folder == null) {
+                message.setText("That folder cannot be read directly. Pick a folder on the device's own "
+                                + "storage or its SD card (not a cloud or Downloads shortcut).");
+                return;
+            }
+            message.setText("Looking through " + folder + " ...");
+            new Thread(() -> {
+                Map<String, String> found = Installer.findFighters(folder);
+                runOnUiThread(() -> confirmFighters(folder, found));
+            }, "RS fighters scan").start();
+            return;
+        }
         if (requestCode != PICK_FOLDER) return;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
             message.setText("");
@@ -469,14 +576,14 @@ public class LauncherActivity extends Activity {
         String addons = found.getOrDefault("addons", "0");
         if (game.isEmpty()) {
             message.setText("No Real Steel game package was found in " + folder + " (looked at "
-                            + found.getOrDefault("looked", "0") + " files). On the console it is under "
-                            + "Content/0000000000000000/584111E0/000D0000.");
+                            + found.getOrDefault("looked", "0") + " files). Copy your own Real Steel "
+                            + "files from your Xbox 360 into that folder and try again.");
             return;
         }
         if (update.isEmpty()) {
             message.setText("The game was found, but not its title update, which ReCompiled Steel needs. "
-                            + "Copy the title update package (on the console under "
-                            + "Content/0000000000000000/584111E0/000B0000) into that folder and try again.");
+                            + "Copy the title update package from your Xbox 360 into that folder and "
+                            + "try again.");
             return;
         }
         message.setText("");

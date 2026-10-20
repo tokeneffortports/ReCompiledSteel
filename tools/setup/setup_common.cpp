@@ -1,5 +1,7 @@
 #include "setup_common.h"
 
+#include "../primport/primport.h"
+
 #include <cstdio>
 #include <iostream>
 
@@ -23,11 +25,15 @@ std::string Usage() {
       "Without options a window (or dialogs) asks for the files. Options:\n"
       "  --scan <folder>       look through a folder (your Xbox 360 Content folder,\n"
       "                        a USB stick) for the game, its update and add-ons\n"
-      "  --game <package>      the game package (Content\\...\\584111E0\\000D0000\\...)\n"
-      "  --update <package>    the title update package (...\\000B0000\\...)\n"
-      "  --addons <folder>     folder of add-on packages (...\\00000002\\), or one package\n"
+      "  --game <package>      the game package\n"
+      "  --update <package>    the title update package\n"
+      "  --addons <folder>     folder of add-on packages, or one package\n"
       "  --dest <folder>       where the game is (default: this program's folder)\n"
       "  --user-root <folder>  where saves and add-ons go (default: the game's)\n"
+      "  --import-fighters <folder>\n"
+      "                        optional: import the robot fighters of another Yuke's\n"
+      "                        Xbox 360 game (its packages, from your own console;\n"
+      "                        currently Pacific Rim) - after installing, or on its own\n"
       "  --cli                 ask on the terminal instead of with dialogs\n"
       "  --yes                 do not ask for confirmation\n"
       "  --help\n";
@@ -50,6 +56,7 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     else if (a == "--scan") value(&args.scan);
     else if (a == "--dest") value(&args.dest);
     else if (a == "--user-root") value(&args.user_root);
+    else if (a == "--import-fighters") value(&args.fighters);
     else if (a == "--cli") args.cli = true;
     else if (a == "--yes" || a == "-y") args.yes = true;
     else if (a == "--help" || a == "-h" || a == "/?") args.help = true;
@@ -130,6 +137,37 @@ int RunConsole(const Plan& plan) {
   return 0;
 }
 
+int RunImportConsole(const Args& args) {
+  const fs::path dest = args.dest.empty() ? ProgramDir() : args.dest;
+  const fs::path user_root = args.user_root.empty() ? DefaultUserRoot() : args.user_root;
+  const fs::path game = dest / "game";
+  if (!fs::is_regular_file(game / "pac" / "ch" / "ch100.pac")) {
+    std::printf("Install Real Steel first: no game files in %s\n", game.string().c_str());
+    return 1;
+  }
+  const rs::primport::Found found = rs::primport::Scan(args.fighters);
+  if (found.game.empty()) {
+    std::printf("No supported game found under %s\n", args.fighters.string().c_str());
+    return 1;
+  }
+  std::printf("Found %s: %zu fighter(s)\n", found.game.c_str(), found.fighters.size());
+  std::fflush(stdout);
+  std::string error;
+  const bool ok = rs::primport::Import(
+      args.fighters, game, rs::primport::ImportDir(user_root),
+      [](const std::string& line) {
+        std::printf("%s\n", line.c_str());
+        std::fflush(stdout);
+      },
+      [](double, const std::string&) {}, &error);
+  if (!ok) {
+    std::printf("FAILED: %s\n", error.c_str());
+    return 1;
+  }
+  std::printf("Done: the fighters are in character select the next time the game starts.\n");
+  return 0;
+}
+
 namespace {
 
 std::string Ask(const std::string& question) {
@@ -153,8 +191,7 @@ bool AskOnTerminal(Args* args) {
       "\nReCompiled Steel setup\n"
       "======================\n"
       "This copies your own Real Steel files from your Xbox 360 into the game\n"
-      "folder. On the console they are under Content\\0000000000000000\\584111E0\\\n"
-      "(000D0000 = the game, 000B0000 = the title update, 00000002 = add-ons).\n"
+      "folder: the game, its title update (required) and any add-ons.\n"
       "Paths can be typed or pasted; leave a line empty to skip.\n\n");
   if (args->game.empty() && args->scan.empty()) {
     const std::string folder = Ask("Folder to search for all of them (empty to name the files one by one): ");

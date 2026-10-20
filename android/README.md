@@ -8,9 +8,7 @@ with Vulkan 1.3 should work but have not been tried.
 ## Installing
 
 1. Copy your own Real Steel files from the Xbox 360 to the device's storage
-   or SD card: the game (`000D0000`), its title update (`000B0000`,
-   required) and any add-ons (`00000002`). The simplest is the whole
-   `Content/0000000000000000/584111E0` folder from the console or USB stick.
+   or SD card: the game, its title update (required) and any add-ons.
 2. Copy `ReCompiledSteel-android-arm64-<version>.apk` to the device and
    install it (allow installs from that file manager when Android asks).
 3. Open ReCompiled Steel, press **Allow file access** (Android's "All files

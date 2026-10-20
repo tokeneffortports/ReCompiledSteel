@@ -7,16 +7,9 @@ computer. It contains no game data: you need your own copy of the game.
 
 SETUP
 -----
-1. Copy your Real Steel files from the Xbox 360 to this PC. On the console
-   they are under  Content\0000000000000000\584111E0\
-       000D0000\...   the game (one file, about 200 MB)
-       000B0000\...   the title update (required)
-       00000002\...   the add-on packs (optional)
-   Get them off with FTP from a console running Aurora or FSD, or with a PC
-   tool that reads Xbox 360 storage (Party Buffalo or Xplorer360 for a hard
-   drive, USBXTAFGUI for a USB stick; Windows cannot read a console-
-   formatted stick by itself). The setup finds the right files in whatever
-   folder you copied them to.
+1. Copy your Real Steel files from the Xbox 360 to this PC: the game, its
+   title update (required) and the add-on packs (optional). The setup finds
+   the right files in whatever folder you copied them to.
 2. Windows: run RealSteelSetup.exe in this folder.
    Linux / Steam Deck: run realsteel-setup (in Desktop Mode on the Deck).
    Point it at the folder you copied and press Install.
@@ -59,6 +52,20 @@ MODS
 ----
 Drop a robot folder into mods/ and start the game: see MODDING.md. Delete
 the folder to remove it again.
+
+FIGHTERS FROM PACIFIC RIM
+-------------------------
+If you also own Yuke's Pacific Rim (Xbox 360), the setup's Import fighters
+button brings its fighters into the game from your own copy.
+
+FRAME RATE AND TEXTURE PACKS
+----------------------------
+Settings > Display > Frame rate: 30, 60, 90 or 120 (the game keeps its
+normal speed; 90 / 120 need a display that fast; online matches play at 60).
+Settings > Enhancements > Export textures writes the game's textures to
+texture_export\; upscale them (Windows: make_texture_pack.ps1 with
+Real-ESRGAN, see the comments at its top) into texture_pack\ and switch on
+Enhancements > Texture pack.
 
 FIRST RUN ON WINDOWS
 --------------------

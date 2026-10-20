@@ -141,12 +141,15 @@ extern "C" REX_FUNC(sub_82116DB0) {
   }
 }
 
+void realsteel_robots_part_stats(uint32_t caller, uint32_t slot, uint32_t id, uint32_t rec, uint8_t* base);  // realsteel_robots.cpp
+
 // Part stat record lookup (slot, id) in the current group - traced for add-on
 // part ids, with the caller, to find who lists parts.
 extern "C" REX_FUNC(sub_82092598) {
   const uint32_t slot = ctx.r4.u32, id = ctx.r5.u32;
   const uint32_t caller = static_cast<uint32_t>(ctx.lr);
   __imp__sub_82092598(ctx, base);
+  realsteel_robots_part_stats(caller, slot, id, ctx.r3.u32, base);
   if (REXCVAR_GET(realsteel_trace_files) && id >= 0xBBF && id < 0x2000) {
     static std::atomic<uint32_t> logs{0};
     if (logs.fetch_add(1) < 400) {

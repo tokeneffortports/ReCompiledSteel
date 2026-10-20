@@ -63,12 +63,17 @@ final class GpuDriver {
 
     /**
      * Takes a picked file: a driver library (.so) or a zip holding one (a
-     * meta.json "libraryName" names it when there are several). Returns ""
-     * on success or what was wrong.
+     * meta.json "libraryName" names it when there are several; the zip's
+     * other libraries are kept beside it, as some drivers need them).
+     * Returns "" on success or what was wrong.
      */
     static String install(Context context, Uri uri, String displayName) {
         byte[] lib = null;
         String libName = null;
+        // The other libraries of a driver package: vendor drivers load
+        // companions from their own folder (Qualcomm's need
+        // adrenoutils_extra.so, 2026-10-16), so they are stored beside it.
+        java.util.Map<String, byte[]> companions = new java.util.HashMap<>();
         String label = displayName;
         try (InputStream in = context.getContentResolver().openInputStream(uri)) {
             byte[] data = readAll(in, 256 << 20);
@@ -110,6 +115,11 @@ final class GpuDriver {
                     return "That zip holds several libraries and no meta.json naming the driver.";
                 }
                 lib = libs.get(libName);
+                for (java.util.Map.Entry<String, byte[]> e : libs.entrySet()) {
+                    if (!e.getKey().equals(libName) && e.getKey().matches("[A-Za-z0-9._-]+") && isElf(e.getValue())) {
+                        companions.put(e.getKey(), e.getValue());
+                    }
+                }
             }
         } catch (Exception e) {
             return "Could not read that file: " + e.getMessage();
@@ -125,6 +135,13 @@ final class GpuDriver {
             out.write(lib);
         } catch (Exception e) {
             return "Could not store the driver: " + e.getMessage();
+        }
+        for (java.util.Map.Entry<String, byte[]> e : companions.entrySet()) {
+            try (OutputStream out = new FileOutputStream(new File(folder, e.getKey()))) {
+                out.write(e.getValue());
+            } catch (Exception ex) {
+                return "Could not store " + e.getKey() + ": " + ex.getMessage();
+            }
         }
         RunState.write(context, "gpu_driver_file", libName);
         RunState.write(context, "gpu_driver_label", label);

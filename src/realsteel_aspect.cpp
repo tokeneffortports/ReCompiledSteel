@@ -17,6 +17,7 @@
 
 #include "realsteel_native_present.h"
 
+#include <rex/logging.h>
 #include "generated/default_final/realsteel_init.h"
 
 REXCVAR_DEFINE_BOOL(realsteel_cull_whole_picture, true, "Real Steel",
@@ -24,6 +25,9 @@ REXCVAR_DEFINE_BOOL(realsteel_cull_whole_picture, true, "Real Steel",
                     "game's 16:9 view (off shows the pop-in in the extra strips)");
 
 extern "C" REX_FUNC(sub_82104688) {
+  // The main camera (fov f1 vertical, near f2, far f3) for the renderer's
+  // own effects (ambient occlusion). One caller, the game's camera setup.
+  realsteel::native_present::NoteCamera(float(ctx.f1.f64), float(ctx.f2.f64), float(ctx.f3.f64));
   const float aspect = realsteel::native_present::CurrentPictureAspect();
   if (aspect > 0.0f && REXCVAR_GET(realsteel_cull_whole_picture)) {
     const double game = 16.0 / 9.0;

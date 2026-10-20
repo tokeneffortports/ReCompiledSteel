@@ -6,6 +6,7 @@
 
 #include <string>
 
+#include "../../tools/primport/primport.h"
 #include "../../tools/setup/install.h"
 
 namespace {
@@ -75,6 +76,40 @@ JNIEXPORT jstring JNICALL Java_com_recompiledsteel_app_Installer_install(JNIEnv*
   std::string error;
   const bool ok = rs::setup::Run(plan, log, progress, &error);
   return env->NewStringUTF(ok ? "" : (error.empty() ? "The install failed." : error.c_str()));
+}
+
+// Optional: fighters of another Yuke's Xbox 360 game (tools/primport). What a
+// folder offers: "game=<name or empty>\nfighters=<name>|<name>...\n".
+JNIEXPORT jstring JNICALL Java_com_recompiledsteel_app_Installer_scanFighters(JNIEnv* env, jclass, jstring folder) {
+  const rs::primport::Found found = rs::primport::Scan(ToString(env, folder));
+  std::string out = "game=" + found.game + "\nfighters=";
+  for (size_t i = 0; i < found.fighters.size(); ++i) out += (i ? "|" : "") + found.fighters[i];
+  out += "\n";
+  return env->NewStringUTF(out.c_str());
+}
+
+// Imports them from |folder|, built on the installed game in |game_dir|, into
+// <user_root>/imported. Same listener as install. "" on success.
+JNIEXPORT jstring JNICALL Java_com_recompiledsteel_app_Installer_importFighters(JNIEnv* env, jclass, jstring folder,
+                                                                                jstring game_dir, jstring user_root,
+                                                                                jobject listener) {
+  jclass cls = env->GetObjectClass(listener);
+  jmethodID on_progress = env->GetMethodID(cls, "onProgress", "(DLjava/lang/String;)V");
+  jmethodID on_log = env->GetMethodID(cls, "onLog", "(Ljava/lang/String;)V");
+  auto log = [&](const std::string& line) {
+    jstring text = env->NewStringUTF(line.c_str());
+    env->CallVoidMethod(listener, on_log, text);
+    env->DeleteLocalRef(text);
+  };
+  auto progress = [&](double fraction, const std::string& what) {
+    jstring text = env->NewStringUTF(what.c_str());
+    env->CallVoidMethod(listener, on_progress, fraction, text);
+    env->DeleteLocalRef(text);
+  };
+  std::string error;
+  const bool ok = rs::primport::Import(ToString(env, folder), ToString(env, game_dir),
+                                       rs::primport::ImportDir(ToString(env, user_root)), log, progress, &error);
+  return env->NewStringUTF(ok ? "" : (error.empty() ? "The import failed." : error.c_str()));
 }
 
 }  // extern "C"
